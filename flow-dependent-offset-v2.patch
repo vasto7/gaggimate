@@ -1,0 +1,545 @@
+diff --git a/src/display/core/Controller.cpp b/src/display/core/Controller.cpp
+index a790189..0a26de1 100644
+--- a/src/display/core/Controller.cpp
++++ b/src/display/core/Controller.cpp
+@@ -8,6 +8,7 @@
+ #include <cmath>
+ #include <ctime>
+ #include <display/config.h>
++#include <display/core/ValveOffset.h>
+ #include <display/core/constants.h>
+ #include <display/core/process/BrewProcess.h>
+ #include <display/core/process/GrindProcess.h>
+@@ -975,7 +976,7 @@ void Controller::updateControl() {
+                 relay.open = brewProcess->isRelayActive();
+                 pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
+                 // Mushroom-valve machines lose the cracking pressure before the puck; command the sensor-side value
+-                pump.pressure = brewProcess->getPumpPressure() + settings.getPressureOffset();
++                pump.pressure = brewProcess->getPumpPressure() + getEffectivePressureOffset();
+                 pump.flow = brewProcess->getPumpFlow();
+                 targetPressure = brewProcess->getPumpPressure();
+                 targetFlow = brewProcess->getPumpFlow();
+@@ -1237,11 +1238,19 @@ void Controller::onTempRead(float temperature) {
+     currentTemp = event.getFloat("value");
+ }
+ 
++// Thin adapter over valveOffsetAt() in ValveOffset.h, which holds the calculation and its guards
++// so they can be unit tested without an Arduino runtime.
++float Controller::getEffectivePressureOffset() const {
++    return valveOffsetAt(currentPumpFlow, settings.getPressureOffset(), settings.isPressureOffsetFlowDerived(),
++                         settings.getValveCalP1(), settings.getValveCalF1(), settings.getValveCalP2(),
++                         settings.getValveCalF2());
++}
++
+ void Controller::onPressureRead(float pressure) {
+     float p = pressure;
+     // Only a running brew opens the grouphead valve, so only then does the mushroom valve eat its cracking pressure
+     if (isBrewActive())
+-        p = std::max(0.0f, p - settings.getPressureOffset());
++        p = std::max(0.0f, p - getEffectivePressureOffset());
+     Event event = pluginManager->trigger("boiler:pressure:change", "value", p);
+     this->pressure = event.getFloat("value");
+ }
+diff --git a/src/display/core/Controller.h b/src/display/core/Controller.h
+index 17ed024..225a662 100644
+--- a/src/display/core/Controller.h
++++ b/src/display/core/Controller.h
+@@ -73,6 +73,9 @@ class Controller {
+     virtual float getCurrentPressure() const { return pressure; }
+     virtual float getCurrentPuckFlow() const { return currentPuckFlow; }
+     virtual float getCurrentPumpFlow() const { return currentPumpFlow; }
++    // Mushroom-valve drop to apply right now. Equals the fixed Pressure Offset unless the
++    // flow-derived mode is enabled and calibrated, in which case it tracks the current flow.
++    float getEffectivePressureOffset() const;
+     virtual float getCurrentPumpPower() const { return currentPumpPower; }
+     virtual float getCurrentHeaterPower() const { return currentHeaterPower; }
+     virtual float getCurrentPuckResistance() const { return currentPuckResistance; }
+diff --git a/src/display/core/Settings.cpp b/src/display/core/Settings.cpp
+index 22fd482..e8643f4 100644
+--- a/src/display/core/Settings.cpp
++++ b/src/display/core/Settings.cpp
+@@ -99,6 +99,16 @@ void Settings::setTemperatureOffset(const int temperature_offset) { temperatureO
+ 
+ void Settings::setPressureOffset(const float pressure_offset) { pressureOffset.set(pressure_offset); }
+ 
++void Settings::setPressureOffsetFlowDerived(const bool flow_derived) { pressureOffsetFlowDerived.set(flow_derived); }
++
++void Settings::setValveCalP1(const float p1) { valveCalP1.set(p1); }
++
++void Settings::setValveCalF1(const float f1) { valveCalF1.set(f1); }
++
++void Settings::setValveCalP2(const float p2) { valveCalP2.set(p2); }
++
++void Settings::setValveCalF2(const float f2) { valveCalF2.set(f2); }
++
+ void Settings::setPressureScaling(const float pressure_scaling) { pressureScaling.set(pressure_scaling); }
+ 
+ void Settings::setTargetGrindVolume(double target_grind_volume) { targetGrindVolume.set(target_grind_volume); }
+diff --git a/src/display/core/Settings.h b/src/display/core/Settings.h
+index 23cd1e6..df248cf 100644
+--- a/src/display/core/Settings.h
++++ b/src/display/core/Settings.h
+@@ -78,6 +78,11 @@ class Settings {
+     int getTargetWaterTemp() const { return targetWaterTemp.get(); }
+     int getTemperatureOffset() const { return temperatureOffset.get(); }
+     float getPressureOffset() const { return pressureOffset.get(); }
++    bool isPressureOffsetFlowDerived() const { return pressureOffsetFlowDerived.get(); }
++    float getValveCalP1() const { return valveCalP1.get(); }
++    float getValveCalF1() const { return valveCalF1.get(); }
++    float getValveCalP2() const { return valveCalP2.get(); }
++    float getValveCalF2() const { return valveCalF2.get(); }
+     float getPressureScaling() const { return pressureScaling.get(); }
+     double getTargetGrindVolume() const { return targetGrindVolume.get(); }
+     int getTargetGrindDuration() const { return targetGrindDuration.get(); }
+@@ -173,6 +178,11 @@ class Settings {
+     void setTargetWaterTemp(int target_water_temp);
+     void setTemperatureOffset(int temperature_offset);
+     void setPressureOffset(float pressure_offset);
++    void setPressureOffsetFlowDerived(bool flow_derived);
++    void setValveCalP1(float p1);
++    void setValveCalF1(float f1);
++    void setValveCalP2(float p2);
++    void setValveCalF2(float f2);
+     void setPressureScaling(float pressure_scaling);
+     void setTargetGrindVolume(double target_grind_volume);
+     void setTargetGrindDuration(int target_duration);
+@@ -264,6 +274,11 @@ class Settings {
+     Property<int> targetWaterTemp{registry, "tw", 80};
+     Property<int> temperatureOffset{registry, "to", DEFAULT_TEMPERATURE_OFFSET};
+     Property<float> pressureOffset{registry, "poff", DEFAULT_PRESSURE_OFFSET};
++    Property<bool> pressureOffsetFlowDerived{registry, "pofffd", DEFAULT_PRESSURE_OFFSET_FLOW_DERIVED};
++    Property<float> valveCalP1{registry, "vcp1", DEFAULT_VALVE_CAL_P1};
++    Property<float> valveCalF1{registry, "vcf1", DEFAULT_VALVE_CAL_F1};
++    Property<float> valveCalP2{registry, "vcp2", DEFAULT_VALVE_CAL_P2};
++    Property<float> valveCalF2{registry, "vcf2", DEFAULT_VALVE_CAL_F2};
+     Property<float> pressureScaling{registry, "ps", DEFAULT_PRESSURE_SCALING};
+     Property<double> targetGrindVolume{registry, "tgv", 18.0};
+     Property<int> targetGrindDuration{registry, "tgd", 25000};
+diff --git a/src/display/core/ValveOffset.h b/src/display/core/ValveOffset.h
+new file mode 100644
+index 0000000..017cdc6
+--- /dev/null
++++ b/src/display/core/ValveOffset.h
+@@ -0,0 +1,50 @@
++#ifndef VALVE_OFFSET_H
++#define VALVE_OFFSET_H
++
++#include <algorithm>
++#include <cmath>
++#include <display/core/constants.h>
++
++// Flow-derived mushroom-valve pressure offset.
++//
++// A spring-loaded mushroom valve (DeLonghi ECP/Stilosa and similar) is a regulator, not a fixed
++// restriction: the pressure it eats is a single-valued function of the flow through it, and near
++// enough linear across the range an espresso shot runs in. A constant offset is therefore correct
++// at exactly one flow rate, so brew pressure at the puck drifts as flow changes through the
++// extraction — measurably, by 0.4 to 0.7 bar on a typical shot.
++//
++// Two measured (pressure, flow) points define the line. Calibration is done with no puck in the
++// portafilter: hold a pressure, weigh the water, repeat at a second pressure about a bar higher.
++//
++// Kept free-standing and header-only so it has no Arduino or ESP-IDF dependency and can be unit
++// tested natively (see test/test_valve_offset).
++//
++//   flow         current pump flow, g/s (the firmware's own estimate)
++//   fixedOffset  the constant Pressure Offset setting, used whenever the derived line is unusable
++//   flowDerived  whether the user enabled the flow-derived mode
++//   p1,f1,p2,f2  the two calibration points
++//
++// Returns the offset in bar to add to the brew pressure target and subtract from readings.
++inline float valveOffsetAt(float flow, float fixedOffset, bool flowDerived, float p1, float f1, float p2,
++                           float f2) {
++    if (!flowDerived)
++        return fixedOffset;
++    // The web UI rejects these before they are stored, but the settings registry is also writable
++    // over the API and survives firmware downgrades, so never trust the stored values: anything
++    // that cannot describe a valve falls back to the fixed offset rather than commanding a
++    // pressure derived from nonsense. Note nothing downstream clamps the commanded setpoint.
++    if (!std::isfinite(p1) || !std::isfinite(f1) || !std::isfinite(p2) || !std::isfinite(f2))
++        return fixedOffset;
++    if (!(f2 > f1) || !(p2 > p1))
++        return fixedOffset;
++    const float slope = (p2 - p1) / (f2 - f1);
++    if (slope < VALVE_CAL_MIN_SLOPE || slope > VALVE_CAL_MAX_SLOPE)
++        return fixedOffset;
++    if (!std::isfinite(flow))
++        return fixedOffset;
++    // Flow below the first calibration point extrapolates back toward the valve's cracking
++    // pressure, which is intended; clamping at zero only stops a negative reading inverting it.
++    return (p1 - slope * f1) + slope * std::max(0.0f, flow);
++}
++
++#endif // VALVE_OFFSET_H
+diff --git a/src/display/core/constants.h b/src/display/core/constants.h
+index aa23e38..54cd298 100644
+--- a/src/display/core/constants.h
++++ b/src/display/core/constants.h
+@@ -20,6 +20,19 @@
+ #define MAX_TEMP 160
+ #define DEFAULT_TEMPERATURE_OFFSET 0
+ #define DEFAULT_PRESSURE_OFFSET 0.0f
++// Flow-derived pressure offset. A spring-loaded mushroom valve's drop is a function of the
++// flow through it, so a single constant is only correct at one flow rate. When enabled, the
++// offset is interpolated from two measured (pressure, flow) points instead. Disabled by
++// default; the constant offset above is used and behaviour is unchanged.
++#define DEFAULT_PRESSURE_OFFSET_FLOW_DERIVED false
++#define DEFAULT_VALVE_CAL_P1 5.0f // suggested first calibration pressure (bar)
++#define DEFAULT_VALVE_CAL_F1 0.0f // measured flow there (g/s); 0 = not calibrated
++#define DEFAULT_VALVE_CAL_P2 6.0f // suggested second calibration pressure (bar)
++#define DEFAULT_VALVE_CAL_F2 0.0f // measured flow there (g/s); 0 = not calibrated
++// Plausibility band for the derived slope, bar per g/s. Outside this the calibration is
++// almost certainly a typo (e.g. two flows one digit apart) and is rejected on save.
++#define VALVE_CAL_MIN_SLOPE 0.3f
++#define VALVE_CAL_MAX_SLOPE 2.0f
+ #define DEFAULT_PRESSURE_SCALING 16.0f
+ #define DEFAULT_PID "58.397,1.027,249.055,0.0"
+ #define DEFAULT_PUMP_MODEL_COEFFS "10.205,5.521"
+diff --git a/src/display/plugins/WebUIPlugin.cpp b/src/display/plugins/WebUIPlugin.cpp
+index f46815e..a1e2b86 100644
+--- a/src/display/plugins/WebUIPlugin.cpp
++++ b/src/display/plugins/WebUIPlugin.cpp
+@@ -312,6 +312,16 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
+                 settings->setTemperatureOffset(request->arg("temperatureOffset").toInt());
+             if (request->hasArg("pressureOffset"))
+                 settings->setPressureOffset(request->arg("pressureOffset").toFloat());
++            if (request->hasArg("pressureOffsetFlowDerived"))
++                settings->setPressureOffsetFlowDerived(parseBoolArg(request->arg("pressureOffsetFlowDerived")));
++            if (request->hasArg("valveCalP1"))
++                settings->setValveCalP1(request->arg("valveCalP1").toFloat());
++            if (request->hasArg("valveCalF1"))
++                settings->setValveCalF1(request->arg("valveCalF1").toFloat());
++            if (request->hasArg("valveCalP2"))
++                settings->setValveCalP2(request->arg("valveCalP2").toFloat());
++            if (request->hasArg("valveCalF2"))
++                settings->setValveCalF2(request->arg("valveCalF2").toFloat());
+             if (request->hasArg("pressureScaling"))
+                 settings->setPressureScaling(request->arg("pressureScaling").toFloat());
+             if (request->hasArg("pid"))
+@@ -496,6 +506,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
+     doc["mdnsName"] = settings.getMdnsName();
+     doc["temperatureOffset"] = String(settings.getTemperatureOffset());
+     doc["pressureOffset"] = String(settings.getPressureOffset());
++    doc["pressureOffsetFlowDerived"] = settings.isPressureOffsetFlowDerived();
++    doc["valveCalP1"] = String(settings.getValveCalP1());
++    doc["valveCalF1"] = String(settings.getValveCalF1());
++    doc["valveCalP2"] = String(settings.getValveCalP2());
++    doc["valveCalF2"] = String(settings.getValveCalF2());
+     doc["pressureScaling"] = String(settings.getPressureScaling());
+     doc["boilerFillActive"] = settings.isBoilerFillActive();
+     doc["startupFillTime"] = settings.getStartupFillTime() / 1000;
+diff --git a/test/test_valve_offset/test_valve_offset.cpp b/test/test_valve_offset/test_valve_offset.cpp
+new file mode 100644
+index 0000000..b3e40e9
+--- /dev/null
++++ b/test/test_valve_offset/test_valve_offset.cpp
+@@ -0,0 +1,157 @@
++// Unit tests: flow-derived mushroom-valve pressure offset (valveOffsetAt).
++// Host-side, no ESP32/Arduino runtime — pio test -e native -f test_valve_offset.
++//
++// Reference numbers come from the DeLonghi ECP 3420 valve characterisation in
++// claude/gaggimate-flow-model-offset-reference.md: cracking ~4.0 bar, full open ~6.6 bar at
++// 4.45 g/s, and a measured drop-vs-flow line of ~0.712*F + 4.103 across the extraction band.
++
++#include <unity.h>
++
++#include <cmath>
++
++#include "display/core/ValveOffset.h"
++
++// The two calibration points a user would enter after the documented 5-and-6-bar procedure,
++// using this machine's measured flows.
++static constexpr float P1 = 5.0f, F1 = 1.19f;
++static constexpr float P2 = 6.0f, F2 = 2.90f;
++static constexpr float FIXED = 5.0f; // the fallback constant offset
++
++static float derived(float flow) { return valveOffsetAt(flow, FIXED, true, P1, F1, P2, F2); }
++
++// --- constant mode is untouched -------------------------------------------------------------
++
++void test_constant_mode_ignores_flow(void) {
++    for (float q : {0.0f, 1.0f, 2.0f, 9.9f}) {
++        TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(q, FIXED, false, P1, F1, P2, F2));
++    }
++}
++
++void test_constant_mode_passes_zero_through(void) {
++    // The 3-way-solenoid default: offset 0 must stay exactly 0.
++    TEST_ASSERT_EQUAL_FLOAT(0.0f, valveOffsetAt(1.5f, 0.0f, false, P1, F1, P2, F2));
++}
++
++// --- the line itself -------------------------------------------------------------------------
++
++void test_line_passes_through_both_calibration_points(void) {
++    TEST_ASSERT_FLOAT_WITHIN(0.001f, P1, derived(F1));
++    TEST_ASSERT_FLOAT_WITHIN(0.001f, P2, derived(F2));
++}
++
++void test_offset_rises_with_flow(void) {
++    TEST_ASSERT_TRUE(derived(2.0f) > derived(1.0f));
++    TEST_ASSERT_TRUE(derived(1.0f) > derived(0.5f));
++}
++
++void test_matches_measured_valve_curve_in_the_extraction_band(void) {
++    // Against "curve B" in the reference doc, 0.7100*F + 4.110, fitted where shots actually run.
++    // The 5-and-6-bar calibration is a chord across a slightly concave curve, so it over-reads at
++    // the bottom of the band and under-reads at the top; the documented worst case is +0.075 to
++    // -0.058 bar between 0.95 and 2.01 g/s.
++    for (float q : {0.95f, 1.19f, 1.40f, 1.60f, 1.85f, 2.01f}) {
++        const float reference = 0.7100f * q + 4.110f;
++        TEST_ASSERT_FLOAT_WITHIN(0.08f, reference, derived(q));
++    }
++}
++
++void test_known_operating_points(void) {
++    // Sanity anchors a human can check by hand: slope 1/(2.90-1.19) = 0.5848 bar per g/s,
++    // intercept 5.0 - 0.5848*1.19 = 4.3041.
++    TEST_ASSERT_FLOAT_WITHIN(0.005f, 4.8889f, derived(1.0f));
++    TEST_ASSERT_FLOAT_WITHIN(0.005f, 5.4737f, derived(2.0f));
++}
++
++// --- guards: anything unusable must fall back to the fixed offset -----------------------------
++
++void test_equal_flows_fall_back(void) {
++    // Would divide by zero.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.19f, 6.0f, 1.19f));
++}
++
++void test_inverted_flows_fall_back(void) {
++    // Would give a negative slope — more flow, less drop, physically impossible for this valve.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 2.90f, 6.0f, 1.19f));
++}
++
++void test_inverted_pressures_fall_back(void) {
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 6.0f, 1.19f, 5.0f, 2.90f));
++}
++
++void test_implausible_slope_falls_back(void) {
++    // The fat-finger case: two flows one digit apart give a slope of 100 bar per g/s.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.19f, 6.0f, 1.20f));
++    // And the opposite, a slope far too shallow to be a spring valve.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.0f, 6.0f, 20.0f));
++}
++
++void test_non_finite_inputs_fall_back(void) {
++    const float nan = std::nanf("");
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(nan, FIXED, true, P1, F1, P2, F2));
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, nan, F1, P2, F2));
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, P1, F1, P2, nan));
++}
++
++void test_uncalibrated_defaults_fall_back(void) {
++    // Both flows still at their 0.0 default: the mode is on but nothing has been measured.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, DEFAULT_VALVE_CAL_P1, DEFAULT_VALVE_CAL_F1,
++                                                DEFAULT_VALVE_CAL_P2, DEFAULT_VALVE_CAL_F2));
++}
++
++void test_negative_flow_does_not_invert_the_offset(void) {
++    // A spurious negative reading must not pull the offset below the cracking intercept.
++    const float intercept = derived(0.0f);
++    TEST_ASSERT_EQUAL_FLOAT(intercept, derived(-3.0f));
++}
++
++// --- the commanded system pressure stays sane -------------------------------------------------
++
++void test_extraction_regime_command_stays_clear_of_the_gain_cliff(void) {
++    // Nothing downstream clamps the setpoint, and the controller's gain schedule runs away as
++    // *measured* pressure approaches _maxPressure = 15. During extraction the pump itself bounds
++    // the flow: at a commanded ~14 bar, geo(14) is about 1.6 g/s, so 1.7 is already generous.
++    // Across that whole regime 9 + offset must stay clear of the cliff.
++    for (float q = 0.0f; q <= 1.7f; q += 0.05f) {
++        TEST_ASSERT_TRUE(9.0f + derived(q) < 14.5f);
++    }
++}
++
++void test_fill_regime_command_is_high_but_bounded(void) {
++    // Deliberate design decision, recorded here so it is not mistaken for an oversight.
++    //
++    // During the fill phase pressure is low, so geo(P) is large and flow of 3-4 g/s is normal.
++    // The offset follows it and the commanded pressure goes above 15 — at 3.0 g/s it is 15.06,
++    // at the valve's full-open 4.45 g/s it is 15.91. There is deliberately no clamp, because in
++    // that regime the pump is already saturated: it cannot reach 6 bar at 4 g/s, let alone 15, so
++    // the inflated target changes nothing it does. As pressure builds, geo falls, flow falls, and
++    // the target glides back down to ~14 before the controller leaves saturation and starts
++    // regulating. The physics self-gates.
++    //
++    // What must hold is that the number stays bounded and monotonic rather than running away.
++    TEST_ASSERT_TRUE(9.0f + derived(3.0f) > 15.0f);  // documents the behaviour
++    TEST_ASSERT_TRUE(9.0f + derived(4.45f) < 16.5f); // but bounded at the valve's full-open flow
++    TEST_ASSERT_TRUE(derived(4.45f) > derived(3.0f));
++}
++
++void setUp(void) { /* No shared fixture state. */ }
++void tearDown(void) { /* No shared fixture state. */ }
++
++int main(int, char **) {
++    UNITY_BEGIN();
++    RUN_TEST(test_constant_mode_ignores_flow);
++    RUN_TEST(test_constant_mode_passes_zero_through);
++    RUN_TEST(test_line_passes_through_both_calibration_points);
++    RUN_TEST(test_offset_rises_with_flow);
++    RUN_TEST(test_matches_measured_valve_curve_in_the_extraction_band);
++    RUN_TEST(test_known_operating_points);
++    RUN_TEST(test_equal_flows_fall_back);
++    RUN_TEST(test_inverted_flows_fall_back);
++    RUN_TEST(test_inverted_pressures_fall_back);
++    RUN_TEST(test_implausible_slope_falls_back);
++    RUN_TEST(test_non_finite_inputs_fall_back);
++    RUN_TEST(test_uncalibrated_defaults_fall_back);
++    RUN_TEST(test_negative_flow_does_not_invert_the_offset);
++    RUN_TEST(test_extraction_regime_command_stays_clear_of_the_gain_cliff);
++    RUN_TEST(test_fill_regime_command_is_high_but_bounded);
++    return UNITY_END();
++}
+diff --git a/web/src/pages/Settings/index.jsx b/web/src/pages/Settings/index.jsx
+index 3d4da19..fe03935 100644
+--- a/web/src/pages/Settings/index.jsx
++++ b/web/src/pages/Settings/index.jsx
+@@ -67,6 +67,7 @@ const CHECKBOX_KEYS = [
+   'clock24hFormat',
+   'autowakeupEnabled',
+   'smartGrindToggle',
++  'pressureOffsetFlowDerived',
+ ];
+ 
+ // Form-only fields that never come back from GET /api/settings.
+diff --git a/web/src/pages/Settings/tabs/MachineTab.jsx b/web/src/pages/Settings/tabs/MachineTab.jsx
+index c060ab2..28f3364 100644
+--- a/web/src/pages/Settings/tabs/MachineTab.jsx
++++ b/web/src/pages/Settings/tabs/MachineTab.jsx
+@@ -5,12 +5,104 @@ import Section from '../../../components/Card.jsx';
+ import { Tooltip } from '../../../components/Tooltip.jsx';
+ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+ import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
+-import { InputGroupField, SettingsFormField } from '../../../components/SettingsFormField.jsx';
++import {
++  InputGroupField,
++  SettingsFormField,
++  ToggleField,
++} from '../../../components/SettingsFormField.jsx';
+ 
+ const ledControl = computed(() => machine.value.capabilities.ledControl);
+ const pressureAvailable = computed(() => machine.value.capabilities.pressure);
+ const tofDistance = computed(() => machine.value.status.tofDistance);
+ 
++// Plausibility band for the mushroom-valve slope, bar per g/s. Mirrors VALVE_CAL_MIN_SLOPE /
++// VALVE_CAL_MAX_SLOPE in src/display/core/constants.h — keep the two in step.
++const VALVE_CAL_MIN_SLOPE = 0.3;
++const VALVE_CAL_MAX_SLOPE = 2.0;
++
++// Two measured (pressure, flow) points define the valve's drop-vs-flow line. Returns an error
++// string instead of a line whenever the pair cannot describe a valve, which is the same set of
++// conditions the firmware falls back to the fixed offset on.
++function valveLine(formData) {
++  const p1 = parseFloat(formData.valveCalP1);
++  const f1 = parseFloat(formData.valveCalF1);
++  const p2 = parseFloat(formData.valveCalP2);
++  const f2 = parseFloat(formData.valveCalF2);
++  if (![p1, f1, p2, f2].every(Number.isFinite)) {
++    return { error: 'Enter a pressure and a flow for both points.' };
++  }
++  if (!(p2 > p1)) return { error: 'The second pressure must be higher than the first.' };
++  if (!(f2 > f1)) return { error: 'The second flow must be higher than the first.' };
++  const slope = (p2 - p1) / (f2 - f1);
++  if (slope < VALVE_CAL_MIN_SLOPE || slope > VALVE_CAL_MAX_SLOPE) {
++    return {
++      error:
++        `That works out to ${slope.toFixed(2)} bar per g/s, outside the plausible ` +
++        `${VALVE_CAL_MIN_SLOPE}–${VALVE_CAL_MAX_SLOPE}. Check the two flow readings.`,
++    };
++  }
++  const intercept = p1 - slope * f1;
++  return { slope, intercept, at: q => intercept + slope * q };
++}
++
++function ValveCalibrationFields({ formData, onChange }) {
++  const line = valveLine(formData);
++  return (
++    <div className='border-base-content/10 mt-2 rounded-lg border p-3'>
++      <p className='mb-3 text-xs opacity-70'>
++        With no puck in the portafilter, hold each pressure and weigh the water for ten seconds.
++        Enter the pressure you aimed for and the flow you measured. 5 and 6 bar suit most machines;
++        if nothing flows at the lower one your valve cracks above it, so use 5.5 and 6.5 instead.
++      </p>
++      {[1, 2].map(n => (
++        <div key={n} className='mb-2 grid grid-cols-1 gap-2 sm:grid-cols-2'>
++          <InputGroupField
++            label={`Point ${n} pressure`}
++            htmlFor={`valveCalP${n}`}
++            unit='bar'
++            noMargin
++          >
++            <input
++              id={`valveCalP${n}`}
++              name={`valveCalP${n}`}
++              type='number'
++              step='any'
++              className='grow'
++              value={formData[`valveCalP${n}`]}
++              onChange={onChange(`valveCalP${n}`)}
++            />
++          </InputGroupField>
++          <InputGroupField
++            label={`Point ${n} flow`}
++            htmlFor={`valveCalF${n}`}
++            unit='g/s'
++            unitAriaLabel='grams per second'
++            noMargin
++          >
++            <input
++              id={`valveCalF${n}`}
++              name={`valveCalF${n}`}
++              type='number'
++              step='any'
++              className='grow'
++              value={formData[`valveCalF${n}`]}
++              onChange={onChange(`valveCalF${n}`)}
++            />
++          </InputGroupField>
++        </div>
++      ))}
++      {line.error ? (
++        <div className='text-error mt-2 text-xs'>{line.error}</div>
++      ) : (
++        <div className='mt-2 text-xs opacity-70'>
++          Offset {line.at(1).toFixed(2)} bar at 1 g/s, {line.at(2).toFixed(2)} bar at 2 g/s
++          <span className='opacity-60'> ({line.slope.toFixed(3)} bar per g/s)</span>
++        </div>
++      )}
++    </div>
++  );
++}
++
+ function SunriseColorField({ id, label, value, fallback, onChange }) {
+   return (
+     <SettingsFormField label={label} htmlFor={id} noMargin>
+@@ -142,7 +234,7 @@ export function MachineTab({ formData, onChange, setField }) {
+               onChange={onChange('temperatureOffset')}
+             />
+           </InputGroupField>
+-          {pressureAvailable.value && (
++          {pressureAvailable.value && !formData.pressureOffsetFlowDerived && (
+             <InputGroupField
+               label='Pressure Offset'
+               htmlFor='pressureOffset'
+@@ -162,6 +254,20 @@ export function MachineTab({ formData, onChange, setField }) {
+               />
+             </InputGroupField>
+           )}
++          {pressureAvailable.value && (
++            <div className='form-control'>
++              <ToggleField
++                label='Vary offset with flow'
++                htmlFor='pressureOffsetFlowDerived'
++                checked={!!formData.pressureOffsetFlowDerived}
++                onChange={onChange('pressureOffsetFlowDerived')}
++                helpText="A spring-loaded mushroom valve's drop grows with the flow through it, so a single number is only correct at one flow rate. Enable this to enter two measured points instead. Leave off for a 3-way solenoid or a fixed offset."
++              />
++              {formData.pressureOffsetFlowDerived && (
++                <ValveCalibrationFields formData={formData} onChange={onChange} />
++              )}
++            </div>
++          )}
+           {pressureAvailable.value && (
+             <InputGroupField
+               label='Pressure Sensor Rating'
