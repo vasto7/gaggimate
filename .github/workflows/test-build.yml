@@ -1,1 +1,86 @@
+name: Test Build (display only)
 
+on:
+  push:
+    branches:
+      - 'flow-offset**'
+  workflow_dispatch:
+
+env:
+  BUILD_REF: v1.9.0
+  PATCH_FILE: flow-dependent-offset-v2.patch
+
+jobs:
+  build-display:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the v1.9.0 release, not the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Fetch the patch from the pushed branch
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD -- "${PATCH_FILE}"
+          ls -l "${PATCH_FILE}"
+
+      - name: Apply the flow-dependent offset patch
+        run: |
+          git apply --ignore-whitespace --verbose "${PATCH_FILE}"
+          echo "--- files changed ---"
+          git status --short
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Record version
+        run: |
+          mkdir -p out
+          git tag -d nightly || true
+          git tag -d db || true
+          git describe --tags --dirty --match "v*" > out/version.txt
+          cat out/version.txt
+
+      - name: Unit tests for the valve-offset maths
+        run: pio test -e native -f test_valve_offset
+
+      - name: Build Web UI
+        run: ./scripts/build_webui.sh
+
+      - name: Build display
+        run: |
+          pio run -e display
+          cp .pio/build/display/firmware.bin   out/display-firmware.bin
+          cp .pio/build/display/partitions.bin out/display-partitions.bin
+          cp .pio/build/display/bootloader.bin out/display-bootloader.bin
+
+      - name: Copy boot_app0
+        run: cp docs/boot_app0.bin out/boot_app0.bin
+
+      - name: Archive firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-firmware
+          path: out/*
+          if-no-files-found: error
