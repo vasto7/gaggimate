@@ -1,0 +1,529 @@
+diff --git a/src/display/core/Controller.cpp b/src/display/core/Controller.cpp
+index cd14e6c5..c3f128ea 100644
+--- a/src/display/core/Controller.cpp
++++ b/src/display/core/Controller.cpp
+@@ -8,6 +8,7 @@
+ #include <cmath>
+ #include <ctime>
+ #include <display/config.h>
++#include <display/core/ValveOffset.h>
+ #include <display/core/constants.h>
+ #include <display/core/process/BrewProcess.h>
+ #include <display/core/process/GrindProcess.h>
+@@ -945,7 +946,7 @@ void Controller::updateControl() {
+                 relay.open = brewProcess->isRelayActive();
+                 pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
+                 // Mushroom-valve machines lose the cracking pressure before the puck; command the sensor-side value
+-                pump.pressure = brewProcess->getPumpPressure() + settings.getPressureOffset();
++                pump.pressure = brewProcess->getPumpPressure() + getEffectivePressureOffset();
+                 pump.flow = brewProcess->getPumpFlow();
+                 targetPressure = brewProcess->getPumpPressure();
+                 targetFlow = brewProcess->getPumpFlow();
+@@ -1167,11 +1168,23 @@ void Controller::onTempRead(float temperature) {
+     currentTemp = event.getFloat("value");
+ }
+ 
++// Thin adapter over valveOffsetAt() in ValveOffset.h, which holds the calculation and its guards
++// so they can be unit tested without an Arduino runtime.
++float Controller::getEffectivePressureOffset() const {
++    return valveOffsetAt(currentPumpFlow, settings.getPressureOffset(), settings.isPressureOffsetFlowDerived(),
++                         settings.getValveCalP1(), settings.getValveCalF1(), settings.getValveCalP2(),
++                         settings.getValveCalF2());
++}
++
+ void Controller::onPressureRead(float pressure) {
++    // Keep the pre-offset reading. It is captured here, in the same call that produces the
++    // display-frame value, so the two are simultaneous by construction and their difference is
++    // exactly the offset that was applied.
++    rawPressure = pressure;
+     float p = pressure;
+     // Only a running brew opens the grouphead valve, so only then does the mushroom valve eat its cracking pressure
+     if (isBrewActive())
+-        p = std::max(0.0f, p - settings.getPressureOffset());
++        p = std::max(0.0f, p - getEffectivePressureOffset());
+     Event event = pluginManager->trigger("boiler:pressure:change", "value", p);
+     this->pressure = event.getFloat("value");
+ }
+diff --git a/src/display/core/Controller.h b/src/display/core/Controller.h
+index 4ec8a454..0066f704 100644
+--- a/src/display/core/Controller.h
++++ b/src/display/core/Controller.h
+@@ -69,8 +69,14 @@ class Controller {
+     virtual float getTargetPressure() const { return targetPressure; }
+     virtual float getTargetFlow() const { return targetFlow; }
+     virtual float getCurrentPressure() const { return pressure; }
++    // The transducer reading before the offset is subtracted. getCurrentPressure() clamps at
++    // zero, so below the offset it is not invertible; this is what the shot log records.
++    virtual float getRawPressure() const { return rawPressure; }
+     virtual float getCurrentPuckFlow() const { return currentPuckFlow; }
+     virtual float getCurrentPumpFlow() const { return currentPumpFlow; }
++    // Mushroom-valve drop to apply right now. Equals the fixed Pressure Offset unless the
++    // flow-derived mode is enabled and calibrated, in which case it tracks the current flow.
++    float getEffectivePressureOffset() const;
+     virtual float getCurrentPumpPower() const { return currentPumpPower; }
+     virtual float getCurrentHeaterPower() const { return currentHeaterPower; }
+     virtual float getCurrentPuckResistance() const { return currentPuckResistance; }
+@@ -208,6 +214,7 @@ class Controller {
+     int mode = MODE_BREW;
+     float currentTemp = 0;
+     float pressure = 0.0f;
++    float rawPressure = 0.0f;
+     float targetPressure = 0.0f;
+     float currentPuckFlow = 0.0f;
+     float currentPumpFlow = 0.0f;
+diff --git a/src/display/core/Settings.cpp b/src/display/core/Settings.cpp
+index 22fd482a..e8643f4d 100644
+--- a/src/display/core/Settings.cpp
++++ b/src/display/core/Settings.cpp
+@@ -99,6 +99,16 @@ void Settings::setTemperatureOffset(const int temperature_offset) { temperatureO
+ 
+ void Settings::setPressureOffset(const float pressure_offset) { pressureOffset.set(pressure_offset); }
+ 
++void Settings::setPressureOffsetFlowDerived(const bool flow_derived) { pressureOffsetFlowDerived.set(flow_derived); }
++
++void Settings::setValveCalP1(const float p1) { valveCalP1.set(p1); }
++
++void Settings::setValveCalF1(const float f1) { valveCalF1.set(f1); }
++
++void Settings::setValveCalP2(const float p2) { valveCalP2.set(p2); }
++
++void Settings::setValveCalF2(const float f2) { valveCalF2.set(f2); }
++
+ void Settings::setPressureScaling(const float pressure_scaling) { pressureScaling.set(pressure_scaling); }
+ 
+ void Settings::setTargetGrindVolume(double target_grind_volume) { targetGrindVolume.set(target_grind_volume); }
+diff --git a/src/display/core/Settings.h b/src/display/core/Settings.h
+index 23cd1e60..df248cfa 100644
+--- a/src/display/core/Settings.h
++++ b/src/display/core/Settings.h
+@@ -78,6 +78,11 @@ class Settings {
+     int getTargetWaterTemp() const { return targetWaterTemp.get(); }
+     int getTemperatureOffset() const { return temperatureOffset.get(); }
+     float getPressureOffset() const { return pressureOffset.get(); }
++    bool isPressureOffsetFlowDerived() const { return pressureOffsetFlowDerived.get(); }
++    float getValveCalP1() const { return valveCalP1.get(); }
++    float getValveCalF1() const { return valveCalF1.get(); }
++    float getValveCalP2() const { return valveCalP2.get(); }
++    float getValveCalF2() const { return valveCalF2.get(); }
+     float getPressureScaling() const { return pressureScaling.get(); }
+     double getTargetGrindVolume() const { return targetGrindVolume.get(); }
+     int getTargetGrindDuration() const { return targetGrindDuration.get(); }
+@@ -173,6 +178,11 @@ class Settings {
+     void setTargetWaterTemp(int target_water_temp);
+     void setTemperatureOffset(int temperature_offset);
+     void setPressureOffset(float pressure_offset);
++    void setPressureOffsetFlowDerived(bool flow_derived);
++    void setValveCalP1(float p1);
++    void setValveCalF1(float f1);
++    void setValveCalP2(float p2);
++    void setValveCalF2(float f2);
+     void setPressureScaling(float pressure_scaling);
+     void setTargetGrindVolume(double target_grind_volume);
+     void setTargetGrindDuration(int target_duration);
+@@ -264,6 +274,11 @@ class Settings {
+     Property<int> targetWaterTemp{registry, "tw", 80};
+     Property<int> temperatureOffset{registry, "to", DEFAULT_TEMPERATURE_OFFSET};
+     Property<float> pressureOffset{registry, "poff", DEFAULT_PRESSURE_OFFSET};
++    Property<bool> pressureOffsetFlowDerived{registry, "pofffd", DEFAULT_PRESSURE_OFFSET_FLOW_DERIVED};
++    Property<float> valveCalP1{registry, "vcp1", DEFAULT_VALVE_CAL_P1};
++    Property<float> valveCalF1{registry, "vcf1", DEFAULT_VALVE_CAL_F1};
++    Property<float> valveCalP2{registry, "vcp2", DEFAULT_VALVE_CAL_P2};
++    Property<float> valveCalF2{registry, "vcf2", DEFAULT_VALVE_CAL_F2};
+     Property<float> pressureScaling{registry, "ps", DEFAULT_PRESSURE_SCALING};
+     Property<double> targetGrindVolume{registry, "tgv", 18.0};
+     Property<int> targetGrindDuration{registry, "tgd", 25000};
+diff --git a/src/display/core/constants.h b/src/display/core/constants.h
+index aa23e38f..54cd2980 100644
+--- a/src/display/core/constants.h
++++ b/src/display/core/constants.h
+@@ -20,6 +20,19 @@
+ #define MAX_TEMP 160
+ #define DEFAULT_TEMPERATURE_OFFSET 0
+ #define DEFAULT_PRESSURE_OFFSET 0.0f
++// Flow-derived pressure offset. A spring-loaded mushroom valve's drop is a function of the
++// flow through it, so a single constant is only correct at one flow rate. When enabled, the
++// offset is interpolated from two measured (pressure, flow) points instead. Disabled by
++// default; the constant offset above is used and behaviour is unchanged.
++#define DEFAULT_PRESSURE_OFFSET_FLOW_DERIVED false
++#define DEFAULT_VALVE_CAL_P1 5.0f // suggested first calibration pressure (bar)
++#define DEFAULT_VALVE_CAL_F1 0.0f // measured flow there (g/s); 0 = not calibrated
++#define DEFAULT_VALVE_CAL_P2 6.0f // suggested second calibration pressure (bar)
++#define DEFAULT_VALVE_CAL_F2 0.0f // measured flow there (g/s); 0 = not calibrated
++// Plausibility band for the derived slope, bar per g/s. Outside this the calibration is
++// almost certainly a typo (e.g. two flows one digit apart) and is rejected on save.
++#define VALVE_CAL_MIN_SLOPE 0.3f
++#define VALVE_CAL_MAX_SLOPE 2.0f
+ #define DEFAULT_PRESSURE_SCALING 16.0f
+ #define DEFAULT_PID "58.397,1.027,249.055,0.0"
+ #define DEFAULT_PUMP_MODEL_COEFFS "10.205,5.521"
+diff --git a/src/display/models/shot_log_format.h b/src/display/models/shot_log_format.h
+index a261d490..fffa7c70 100644
+--- a/src/display/models/shot_log_format.h
++++ b/src/display/models/shot_log_format.h
+@@ -19,11 +19,11 @@
+ // Older files may have fewer fields - use fieldsMask to determine layout.
+ 
+ static constexpr uint32_t SHOT_LOG_MAGIC = 0x544F4853; // 'S''H''O''T' little-endian 0x54 0x4F 0x48 0x53
+-static constexpr uint8_t SHOT_LOG_VERSION = 7;
++static constexpr uint8_t SHOT_LOG_VERSION = 8;
+ static constexpr uint16_t SHOT_LOG_HEADER_SIZE = 512;
+ static constexpr uint16_t SHOT_LOG_SAMPLE_INTERVAL_MS = 250; // nominal recording interval
+-static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x3FFF; // 14 fields present
+-static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 30;
++static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x7FFF; // 15 fields present
++static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 32;
+ 
+ // Field bit positions (for future expansion)
+ static constexpr uint32_t SHOT_LOG_FIELD_T = 0x0001;  // elapsed time (bit 0)
+@@ -40,7 +40,11 @@ static constexpr uint32_t SHOT_LOG_FIELD_EV = 0x0400; // estimated weight (bit 1
+ static constexpr uint32_t SHOT_LOG_FIELD_PR = 0x0800; // puck resistance (bit 11)
+ static constexpr uint32_t SHOT_LOG_FIELD_SI = 0x1000; // system info (bit 12)
+ static constexpr uint32_t SHOT_LOG_FIELD_WP = 0x2000; // cumulative water pumped (bit 13)
+-// Bits 14-31 available for future fields
++// Raw transducer pressure, before the display-frame offset is subtracted and before that
++// subtraction is clamped at zero. cp is lossy below the offset -- max(0, p - offset) cannot be
++// inverted -- so the pre-offset value has to be recorded, not just the offset itself. [v8]
++static constexpr uint32_t SHOT_LOG_FIELD_RP = 0x4000; // raw system pressure (bit 14)
++// Bits 15-31 available for future fields
+ 
+ // Phase transition structure for version 5+ headers
+ // transitionReason was a reserved/padding byte through v5; repurposing it keeps the struct byte-identical,
+@@ -92,8 +96,21 @@ struct ShotLogHeader {
+     // Carved from the v5 reserved padding; old files have 0 here and old readers ignore it.
+     uint16_t brewDelayMs; // 2 bytes
+ 
++    // Version 8: the settings that are needed to interpret the samples and that can change
++    // between the shot and the export. Carved from the v5 padding, so the header size and the
++    // layout of everything above are unchanged and old readers skip it.
++    uint8_t settingsVersion;            // 1; 0 = not written (pre-v8 file)
++    uint8_t pressureOffsetMode;         // 0 = fixed, 1 = linear in flow
++    uint8_t pressureOffsetModelVersion; // how to read the two coefficients below
++    uint8_t settingsFlags;              // reserved for per-shot flags
++    float pressureOffsetIntercept;      // bar
++    float pressureOffsetSlope;          // bar per g/s; 0 in fixed mode
++    float pumpF1;                       // flow model in force at shot time
++    float pumpF9;
++    uint32_t firmwareBuildId; // FNV-1a of BUILD_GIT_VERSION; identifies the semantics above
++
+     // Future expansion - pad to 512 bytes total
+-    uint8_t reserved_v5[50]; // Manual padding to reach 512 bytes
++    uint8_t reserved_v8[26]; // Manual padding to reach 512 bytes
+ };
+ #pragma pack(pop)
+ 
+@@ -107,6 +124,8 @@ struct ShotLogHeader {
+ //   pr: puck resistance * 100 (0.01 step, saturates at uint16_t max)
+ //   si: system info bit-packed (see SYSTEM_INFO_* constants)
+ //   wp: water pumped * 10 (0.1 ml resolution)
++//   rp: raw system pressure * 10 (0.1 bar), as read from the transducer before the display
++//       offset is applied. Equals cp exactly when the offset is zero.
+ #pragma pack(push, 1)
+ struct ShotLogSample {
+     uint32_t t;  // actual elapsed milliseconds from shotStart
+@@ -123,6 +142,7 @@ struct ShotLogSample {
+     uint16_t pr; // puck resistance * 100
+     uint16_t si; // system info bit-packed
+     uint16_t wp; // water pumped * 10
++    uint16_t rp; // raw system pressure * 10, pre-offset and pre-clamp (v8+)
+ };
+ #pragma pack(pop)
+ 
+diff --git a/src/display/plugins/ShotHistoryPlugin.cpp b/src/display/plugins/ShotHistoryPlugin.cpp
+index b0e56d8c..d5d79907 100644
+--- a/src/display/plugins/ShotHistoryPlugin.cpp
++++ b/src/display/plugins/ShotHistoryPlugin.cpp
+@@ -9,6 +9,7 @@
+ #include <display/core/utils.h>
+ #include <display/models/shot_log_format.h>
+ #include <display/util/PsramAllocator.h>
++#include <version.h>
+ 
+ namespace {
+ constexpr float TEMP_SCALE = 10.0f;
+@@ -102,6 +103,52 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
+     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
+ }
+ 
++namespace {
++// FNV-1a over the build string. A build id only has to be comparable, not readable.
++uint32_t hashBuildId(const char *s) {
++    uint32_t h = 2166136261u;
++    for (; s != nullptr && *s != '\0'; ++s) {
++        h ^= static_cast<uint8_t>(*s);
++        h *= 16777619u;
++    }
++    return h;
++}
++} // namespace
++
++// Record the settings the samples cannot be read without. Without these an export has to assume
++// whatever the UI happens to say when it runs, which is wrong for any shot pulled before a change.
++void ShotHistoryPlugin::writeSettingsSnapshot(ShotLogHeader &h) const {
++    Settings &settings = controller->getSettings();
++    h.settingsVersion = 1;
++    h.settingsFlags = 0;
++    h.pressureOffsetModelVersion = 1;
++    if (settings.isPressureOffsetFlowDerived()) {
++        // Same construction as valveOffsetAt(): the two calibration points define the line.
++        const float f1 = settings.getValveCalF1(), f2 = settings.getValveCalF2();
++        const float p1 = settings.getValveCalP1(), p2 = settings.getValveCalP2();
++        const float slope = (f2 > f1) ? (p2 - p1) / (f2 - f1) : 0.0f;
++        h.pressureOffsetMode = slope != 0.0f ? 1 : 0;
++        h.pressureOffsetSlope = slope;
++        h.pressureOffsetIntercept = slope != 0.0f ? p1 - slope * f1 : settings.getPressureOffset();
++    } else {
++        h.pressureOffsetMode = 0;
++        h.pressureOffsetSlope = 0.0f;
++        h.pressureOffsetIntercept = settings.getPressureOffset();
++    }
++    // "F1,F9[,...]" -- only the first two are needed to rebuild geoFlow().
++    const String coeffs = settings.getPumpModelCoeffs();
++    const int comma = coeffs.indexOf(',');
++    if (comma > 0) {
++        h.pumpF1 = coeffs.substring(0, comma).toFloat();
++        const int next = coeffs.indexOf(',', comma + 1);
++        h.pumpF9 = (next > 0 ? coeffs.substring(comma + 1, next) : coeffs.substring(comma + 1)).toFloat();
++    } else {
++        h.pumpF1 = NAN;
++        h.pumpF9 = NAN;
++    }
++    h.firmwareBuildId = hashBuildId(BUILD_GIT_VERSION);
++}
++
+ void ShotHistoryPlugin::record() {
+     bool shouldRecord = recording || extendedRecording;
+ 
+@@ -131,6 +178,7 @@ void ShotHistoryPlugin::record() {
+                 // Brew delay (ms) the shot ran with; round and clamp into the uint16_t field
+                 double delayMs = currentBrewDelay > 0.0 ? currentBrewDelay + 0.5 : 0.0;
+                 header.brewDelayMs = delayMs > 65535.0 ? 65535 : static_cast<uint16_t>(delayMs);
++                writeSettingsSnapshot(header);
+                 // Write header placeholder
+                 currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+             }
+@@ -165,6 +213,8 @@ void ShotHistoryPlugin::record() {
+         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
+         sample.si = getSystemInfo(); // Pack system state information
+         sample.wp = encodeUnsigned(controller->getCurrentWaterPumped(), WEIGHT_SCALE, WEIGHT_MAX_VALUE);
++        // Pre-offset, pre-clamp transducer reading. cp above is lossy below the offset.
++        sample.rp = encodeUnsigned(controller->getRawPressure(), PRESSURE_SCALE, PRESSURE_MAX_VALUE);
+ 
+         // Track phase transitions
+         if (controller->getMode() == MODE_BREW) {
+diff --git a/src/display/plugins/ShotHistoryPlugin.h b/src/display/plugins/ShotHistoryPlugin.h
+index 66cf38c0..0f2550b0 100644
+--- a/src/display/plugins/ShotHistoryPlugin.h
++++ b/src/display/plugins/ShotHistoryPlugin.h
+@@ -45,6 +45,7 @@ class ShotHistoryPlugin : public Plugin {
+     void saveNotes(const String &id, const JsonDocument &notes);
+     void loadNotes(const String &id, JsonDocument &notes);
+     void startRecording();
++    void writeSettingsSnapshot(ShotLogHeader &header) const;
+ 
+     uint16_t getSystemInfo(); // Helper to pack system state bits
+ 
+diff --git a/src/display/plugins/WebUIPlugin.cpp b/src/display/plugins/WebUIPlugin.cpp
+index f46815e0..a1e2b863 100644
+--- a/src/display/plugins/WebUIPlugin.cpp
++++ b/src/display/plugins/WebUIPlugin.cpp
+@@ -312,6 +312,16 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
+                 settings->setTemperatureOffset(request->arg("temperatureOffset").toInt());
+             if (request->hasArg("pressureOffset"))
+                 settings->setPressureOffset(request->arg("pressureOffset").toFloat());
++            if (request->hasArg("pressureOffsetFlowDerived"))
++                settings->setPressureOffsetFlowDerived(parseBoolArg(request->arg("pressureOffsetFlowDerived")));
++            if (request->hasArg("valveCalP1"))
++                settings->setValveCalP1(request->arg("valveCalP1").toFloat());
++            if (request->hasArg("valveCalF1"))
++                settings->setValveCalF1(request->arg("valveCalF1").toFloat());
++            if (request->hasArg("valveCalP2"))
++                settings->setValveCalP2(request->arg("valveCalP2").toFloat());
++            if (request->hasArg("valveCalF2"))
++                settings->setValveCalF2(request->arg("valveCalF2").toFloat());
+             if (request->hasArg("pressureScaling"))
+                 settings->setPressureScaling(request->arg("pressureScaling").toFloat());
+             if (request->hasArg("pid"))
+@@ -496,6 +506,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
+     doc["mdnsName"] = settings.getMdnsName();
+     doc["temperatureOffset"] = String(settings.getTemperatureOffset());
+     doc["pressureOffset"] = String(settings.getPressureOffset());
++    doc["pressureOffsetFlowDerived"] = settings.isPressureOffsetFlowDerived();
++    doc["valveCalP1"] = String(settings.getValveCalP1());
++    doc["valveCalF1"] = String(settings.getValveCalF1());
++    doc["valveCalP2"] = String(settings.getValveCalP2());
++    doc["valveCalF2"] = String(settings.getValveCalF2());
+     doc["pressureScaling"] = String(settings.getPressureScaling());
+     doc["boilerFillActive"] = settings.isBoilerFillActive();
+     doc["startupFillTime"] = settings.getStartupFillTime() / 1000;
+diff --git a/web/src/pages/Settings/index.jsx b/web/src/pages/Settings/index.jsx
+index 3d4da191..fe039359 100644
+--- a/web/src/pages/Settings/index.jsx
++++ b/web/src/pages/Settings/index.jsx
+@@ -67,6 +67,7 @@ const CHECKBOX_KEYS = [
+   'clock24hFormat',
+   'autowakeupEnabled',
+   'smartGrindToggle',
++  'pressureOffsetFlowDerived',
+ ];
+ 
+ // Form-only fields that never come back from GET /api/settings.
+diff --git a/web/src/pages/Settings/tabs/MachineTab.jsx b/web/src/pages/Settings/tabs/MachineTab.jsx
+index c060ab2c..28f33649 100644
+--- a/web/src/pages/Settings/tabs/MachineTab.jsx
++++ b/web/src/pages/Settings/tabs/MachineTab.jsx
+@@ -5,12 +5,104 @@ import Section from '../../../components/Card.jsx';
+ import { Tooltip } from '../../../components/Tooltip.jsx';
+ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+ import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
+-import { InputGroupField, SettingsFormField } from '../../../components/SettingsFormField.jsx';
++import {
++  InputGroupField,
++  SettingsFormField,
++  ToggleField,
++} from '../../../components/SettingsFormField.jsx';
+ 
+ const ledControl = computed(() => machine.value.capabilities.ledControl);
+ const pressureAvailable = computed(() => machine.value.capabilities.pressure);
+ const tofDistance = computed(() => machine.value.status.tofDistance);
+ 
++// Plausibility band for the mushroom-valve slope, bar per g/s. Mirrors VALVE_CAL_MIN_SLOPE /
++// VALVE_CAL_MAX_SLOPE in src/display/core/constants.h — keep the two in step.
++const VALVE_CAL_MIN_SLOPE = 0.3;
++const VALVE_CAL_MAX_SLOPE = 2.0;
++
++// Two measured (pressure, flow) points define the valve's drop-vs-flow line. Returns an error
++// string instead of a line whenever the pair cannot describe a valve, which is the same set of
++// conditions the firmware falls back to the fixed offset on.
++function valveLine(formData) {
++  const p1 = parseFloat(formData.valveCalP1);
++  const f1 = parseFloat(formData.valveCalF1);
++  const p2 = parseFloat(formData.valveCalP2);
++  const f2 = parseFloat(formData.valveCalF2);
++  if (![p1, f1, p2, f2].every(Number.isFinite)) {
++    return { error: 'Enter a pressure and a flow for both points.' };
++  }
++  if (!(p2 > p1)) return { error: 'The second pressure must be higher than the first.' };
++  if (!(f2 > f1)) return { error: 'The second flow must be higher than the first.' };
++  const slope = (p2 - p1) / (f2 - f1);
++  if (slope < VALVE_CAL_MIN_SLOPE || slope > VALVE_CAL_MAX_SLOPE) {
++    return {
++      error:
++        `That works out to ${slope.toFixed(2)} bar per g/s, outside the plausible ` +
++        `${VALVE_CAL_MIN_SLOPE}–${VALVE_CAL_MAX_SLOPE}. Check the two flow readings.`,
++    };
++  }
++  const intercept = p1 - slope * f1;
++  return { slope, intercept, at: q => intercept + slope * q };
++}
++
++function ValveCalibrationFields({ formData, onChange }) {
++  const line = valveLine(formData);
++  return (
++    <div className='border-base-content/10 mt-2 rounded-lg border p-3'>
++      <p className='mb-3 text-xs opacity-70'>
++        With no puck in the portafilter, hold each pressure and weigh the water for ten seconds.
++        Enter the pressure you aimed for and the flow you measured. 5 and 6 bar suit most machines;
++        if nothing flows at the lower one your valve cracks above it, so use 5.5 and 6.5 instead.
++      </p>
++      {[1, 2].map(n => (
++        <div key={n} className='mb-2 grid grid-cols-1 gap-2 sm:grid-cols-2'>
++          <InputGroupField
++            label={`Point ${n} pressure`}
++            htmlFor={`valveCalP${n}`}
++            unit='bar'
++            noMargin
++          >
++            <input
++              id={`valveCalP${n}`}
++              name={`valveCalP${n}`}
++              type='number'
++              step='any'
++              className='grow'
++              value={formData[`valveCalP${n}`]}
++              onChange={onChange(`valveCalP${n}`)}
++            />
++          </InputGroupField>
++          <InputGroupField
++            label={`Point ${n} flow`}
++            htmlFor={`valveCalF${n}`}
++            unit='g/s'
++            unitAriaLabel='grams per second'
++            noMargin
++          >
++            <input
++              id={`valveCalF${n}`}
++              name={`valveCalF${n}`}
++              type='number'
++              step='any'
++              className='grow'
++              value={formData[`valveCalF${n}`]}
++              onChange={onChange(`valveCalF${n}`)}
++            />
++          </InputGroupField>
++        </div>
++      ))}
++      {line.error ? (
++        <div className='text-error mt-2 text-xs'>{line.error}</div>
++      ) : (
++        <div className='mt-2 text-xs opacity-70'>
++          Offset {line.at(1).toFixed(2)} bar at 1 g/s, {line.at(2).toFixed(2)} bar at 2 g/s
++          <span className='opacity-60'> ({line.slope.toFixed(3)} bar per g/s)</span>
++        </div>
++      )}
++    </div>
++  );
++}
++
+ function SunriseColorField({ id, label, value, fallback, onChange }) {
+   return (
+     <SettingsFormField label={label} htmlFor={id} noMargin>
+@@ -142,7 +234,7 @@ export function MachineTab({ formData, onChange, setField }) {
+               onChange={onChange('temperatureOffset')}
+             />
+           </InputGroupField>
+-          {pressureAvailable.value && (
++          {pressureAvailable.value && !formData.pressureOffsetFlowDerived && (
+             <InputGroupField
+               label='Pressure Offset'
+               htmlFor='pressureOffset'
+@@ -162,6 +254,20 @@ export function MachineTab({ formData, onChange, setField }) {
+               />
+             </InputGroupField>
+           )}
++          {pressureAvailable.value && (
++            <div className='form-control'>
++              <ToggleField
++                label='Vary offset with flow'
++                htmlFor='pressureOffsetFlowDerived'
++                checked={!!formData.pressureOffsetFlowDerived}
++                onChange={onChange('pressureOffsetFlowDerived')}
++                helpText="A spring-loaded mushroom valve's drop grows with the flow through it, so a single number is only correct at one flow rate. Enable this to enter two measured points instead. Leave off for a 3-way solenoid or a fixed offset."
++              />
++              {formData.pressureOffsetFlowDerived && (
++                <ValveCalibrationFields formData={formData} onChange={onChange} />
++              )}
++            </div>
++          )}
+           {pressureAvailable.value && (
+             <InputGroupField
+               label='Pressure Sensor Rating'
+diff --git a/web/src/pages/ShotHistory/parseBinaryShot.js b/web/src/pages/ShotHistory/parseBinaryShot.js
+index 1dc936e0..fd4f30b4 100644
+--- a/web/src/pages/ShotHistory/parseBinaryShot.js
++++ b/web/src/pages/ShotHistory/parseBinaryShot.js
+@@ -29,6 +29,7 @@ const FIELD_BITS = {
+   PR: 11, // puck resistance
+   SI: 12, // system info (v2+)
+   WP: 13, // cumulative water pumped
++  RP: 14, // raw system pressure, pre-offset and pre-clamp (v8+)
+   // Phase number moved to header transitions in v5+
+ };
+ 
+@@ -51,6 +52,7 @@ const FIELD_DEFS = {
+   [FIELD_BITS.V]: { name: 'v', type: 'uint16', scale: WEIGHT_SCALE },
+   [FIELD_BITS.EV]: { name: 'ev', type: 'uint16', scale: WEIGHT_SCALE },
+   [FIELD_BITS.PR]: { name: 'pr', type: 'uint16', scale: RESISTANCE_SCALE },
++  [FIELD_BITS.RP]: { name: 'rp', type: 'uint16', scale: PRESSURE_SCALE },
+   [FIELD_BITS.SI]: {
+     name: 'systemInfo',
+     type: 'uint16',
