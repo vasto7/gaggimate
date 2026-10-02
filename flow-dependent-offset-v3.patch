@@ -132,6 +132,62 @@ index 23cd1e60..df248cfa 100644
      Property<float> pressureScaling{registry, "ps", DEFAULT_PRESSURE_SCALING};
      Property<double> targetGrindVolume{registry, "tgv", 18.0};
      Property<int> targetGrindDuration{registry, "tgd", 25000};
+diff --git a/src/display/core/ValveOffset.h b/src/display/core/ValveOffset.h
+new file mode 100644
+index 00000000..017cdc68
+--- /dev/null
++++ b/src/display/core/ValveOffset.h
+@@ -0,0 +1,50 @@
++#ifndef VALVE_OFFSET_H
++#define VALVE_OFFSET_H
++
++#include <algorithm>
++#include <cmath>
++#include <display/core/constants.h>
++
++// Flow-derived mushroom-valve pressure offset.
++//
++// A spring-loaded mushroom valve (DeLonghi ECP/Stilosa and similar) is a regulator, not a fixed
++// restriction: the pressure it eats is a single-valued function of the flow through it, and near
++// enough linear across the range an espresso shot runs in. A constant offset is therefore correct
++// at exactly one flow rate, so brew pressure at the puck drifts as flow changes through the
++// extraction — measurably, by 0.4 to 0.7 bar on a typical shot.
++//
++// Two measured (pressure, flow) points define the line. Calibration is done with no puck in the
++// portafilter: hold a pressure, weigh the water, repeat at a second pressure about a bar higher.
++//
++// Kept free-standing and header-only so it has no Arduino or ESP-IDF dependency and can be unit
++// tested natively (see test/test_valve_offset).
++//
++//   flow         current pump flow, g/s (the firmware's own estimate)
++//   fixedOffset  the constant Pressure Offset setting, used whenever the derived line is unusable
++//   flowDerived  whether the user enabled the flow-derived mode
++//   p1,f1,p2,f2  the two calibration points
++//
++// Returns the offset in bar to add to the brew pressure target and subtract from readings.
++inline float valveOffsetAt(float flow, float fixedOffset, bool flowDerived, float p1, float f1, float p2,
++                           float f2) {
++    if (!flowDerived)
++        return fixedOffset;
++    // The web UI rejects these before they are stored, but the settings registry is also writable
++    // over the API and survives firmware downgrades, so never trust the stored values: anything
++    // that cannot describe a valve falls back to the fixed offset rather than commanding a
++    // pressure derived from nonsense. Note nothing downstream clamps the commanded setpoint.
++    if (!std::isfinite(p1) || !std::isfinite(f1) || !std::isfinite(p2) || !std::isfinite(f2))
++        return fixedOffset;
++    if (!(f2 > f1) || !(p2 > p1))
++        return fixedOffset;
++    const float slope = (p2 - p1) / (f2 - f1);
++    if (slope < VALVE_CAL_MIN_SLOPE || slope > VALVE_CAL_MAX_SLOPE)
++        return fixedOffset;
++    if (!std::isfinite(flow))
++        return fixedOffset;
++    // Flow below the first calibration point extrapolates back toward the valve's cracking
++    // pressure, which is intended; clamping at zero only stops a negative reading inverting it.
++    return (p1 - slope * f1) + slope * std::max(0.0f, flow);
++}
++
++#endif // VALVE_OFFSET_H
 diff --git a/src/display/core/constants.h b/src/display/core/constants.h
 index aa23e38f..54cd2980 100644
 --- a/src/display/core/constants.h
@@ -355,6 +411,169 @@ index f46815e0..a1e2b863 100644
      doc["pressureScaling"] = String(settings.getPressureScaling());
      doc["boilerFillActive"] = settings.isBoilerFillActive();
      doc["startupFillTime"] = settings.getStartupFillTime() / 1000;
+diff --git a/test/test_valve_offset/test_valve_offset.cpp b/test/test_valve_offset/test_valve_offset.cpp
+new file mode 100644
+index 00000000..b3e40e91
+--- /dev/null
++++ b/test/test_valve_offset/test_valve_offset.cpp
+@@ -0,0 +1,157 @@
++// Unit tests: flow-derived mushroom-valve pressure offset (valveOffsetAt).
++// Host-side, no ESP32/Arduino runtime — pio test -e native -f test_valve_offset.
++//
++// Reference numbers come from the DeLonghi ECP 3420 valve characterisation in
++// claude/gaggimate-flow-model-offset-reference.md: cracking ~4.0 bar, full open ~6.6 bar at
++// 4.45 g/s, and a measured drop-vs-flow line of ~0.712*F + 4.103 across the extraction band.
++
++#include <unity.h>
++
++#include <cmath>
++
++#include "display/core/ValveOffset.h"
++
++// The two calibration points a user would enter after the documented 5-and-6-bar procedure,
++// using this machine's measured flows.
++static constexpr float P1 = 5.0f, F1 = 1.19f;
++static constexpr float P2 = 6.0f, F2 = 2.90f;
++static constexpr float FIXED = 5.0f; // the fallback constant offset
++
++static float derived(float flow) { return valveOffsetAt(flow, FIXED, true, P1, F1, P2, F2); }
++
++// --- constant mode is untouched -------------------------------------------------------------
++
++void test_constant_mode_ignores_flow(void) {
++    for (float q : {0.0f, 1.0f, 2.0f, 9.9f}) {
++        TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(q, FIXED, false, P1, F1, P2, F2));
++    }
++}
++
++void test_constant_mode_passes_zero_through(void) {
++    // The 3-way-solenoid default: offset 0 must stay exactly 0.
++    TEST_ASSERT_EQUAL_FLOAT(0.0f, valveOffsetAt(1.5f, 0.0f, false, P1, F1, P2, F2));
++}
++
++// --- the line itself -------------------------------------------------------------------------
++
++void test_line_passes_through_both_calibration_points(void) {
++    TEST_ASSERT_FLOAT_WITHIN(0.001f, P1, derived(F1));
++    TEST_ASSERT_FLOAT_WITHIN(0.001f, P2, derived(F2));
++}
++
++void test_offset_rises_with_flow(void) {
++    TEST_ASSERT_TRUE(derived(2.0f) > derived(1.0f));
++    TEST_ASSERT_TRUE(derived(1.0f) > derived(0.5f));
++}
++
++void test_matches_measured_valve_curve_in_the_extraction_band(void) {
++    // Against "curve B" in the reference doc, 0.7100*F + 4.110, fitted where shots actually run.
++    // The 5-and-6-bar calibration is a chord across a slightly concave curve, so it over-reads at
++    // the bottom of the band and under-reads at the top; the documented worst case is +0.075 to
++    // -0.058 bar between 0.95 and 2.01 g/s.
++    for (float q : {0.95f, 1.19f, 1.40f, 1.60f, 1.85f, 2.01f}) {
++        const float reference = 0.7100f * q + 4.110f;
++        TEST_ASSERT_FLOAT_WITHIN(0.08f, reference, derived(q));
++    }
++}
++
++void test_known_operating_points(void) {
++    // Sanity anchors a human can check by hand: slope 1/(2.90-1.19) = 0.5848 bar per g/s,
++    // intercept 5.0 - 0.5848*1.19 = 4.3041.
++    TEST_ASSERT_FLOAT_WITHIN(0.005f, 4.8889f, derived(1.0f));
++    TEST_ASSERT_FLOAT_WITHIN(0.005f, 5.4737f, derived(2.0f));
++}
++
++// --- guards: anything unusable must fall back to the fixed offset -----------------------------
++
++void test_equal_flows_fall_back(void) {
++    // Would divide by zero.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.19f, 6.0f, 1.19f));
++}
++
++void test_inverted_flows_fall_back(void) {
++    // Would give a negative slope — more flow, less drop, physically impossible for this valve.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 2.90f, 6.0f, 1.19f));
++}
++
++void test_inverted_pressures_fall_back(void) {
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 6.0f, 1.19f, 5.0f, 2.90f));
++}
++
++void test_implausible_slope_falls_back(void) {
++    // The fat-finger case: two flows one digit apart give a slope of 100 bar per g/s.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.19f, 6.0f, 1.20f));
++    // And the opposite, a slope far too shallow to be a spring valve.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, 5.0f, 1.0f, 6.0f, 20.0f));
++}
++
++void test_non_finite_inputs_fall_back(void) {
++    const float nan = std::nanf("");
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(nan, FIXED, true, P1, F1, P2, F2));
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, nan, F1, P2, F2));
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, P1, F1, P2, nan));
++}
++
++void test_uncalibrated_defaults_fall_back(void) {
++    // Both flows still at their 0.0 default: the mode is on but nothing has been measured.
++    TEST_ASSERT_EQUAL_FLOAT(FIXED, valveOffsetAt(1.5f, FIXED, true, DEFAULT_VALVE_CAL_P1, DEFAULT_VALVE_CAL_F1,
++                                                DEFAULT_VALVE_CAL_P2, DEFAULT_VALVE_CAL_F2));
++}
++
++void test_negative_flow_does_not_invert_the_offset(void) {
++    // A spurious negative reading must not pull the offset below the cracking intercept.
++    const float intercept = derived(0.0f);
++    TEST_ASSERT_EQUAL_FLOAT(intercept, derived(-3.0f));
++}
++
++// --- the commanded system pressure stays sane -------------------------------------------------
++
++void test_extraction_regime_command_stays_clear_of_the_gain_cliff(void) {
++    // Nothing downstream clamps the setpoint, and the controller's gain schedule runs away as
++    // *measured* pressure approaches _maxPressure = 15. During extraction the pump itself bounds
++    // the flow: at a commanded ~14 bar, geo(14) is about 1.6 g/s, so 1.7 is already generous.
++    // Across that whole regime 9 + offset must stay clear of the cliff.
++    for (float q = 0.0f; q <= 1.7f; q += 0.05f) {
++        TEST_ASSERT_TRUE(9.0f + derived(q) < 14.5f);
++    }
++}
++
++void test_fill_regime_command_is_high_but_bounded(void) {
++    // Deliberate design decision, recorded here so it is not mistaken for an oversight.
++    //
++    // During the fill phase pressure is low, so geo(P) is large and flow of 3-4 g/s is normal.
++    // The offset follows it and the commanded pressure goes above 15 — at 3.0 g/s it is 15.06,
++    // at the valve's full-open 4.45 g/s it is 15.91. There is deliberately no clamp, because in
++    // that regime the pump is already saturated: it cannot reach 6 bar at 4 g/s, let alone 15, so
++    // the inflated target changes nothing it does. As pressure builds, geo falls, flow falls, and
++    // the target glides back down to ~14 before the controller leaves saturation and starts
++    // regulating. The physics self-gates.
++    //
++    // What must hold is that the number stays bounded and monotonic rather than running away.
++    TEST_ASSERT_TRUE(9.0f + derived(3.0f) > 15.0f);  // documents the behaviour
++    TEST_ASSERT_TRUE(9.0f + derived(4.45f) < 16.5f); // but bounded at the valve's full-open flow
++    TEST_ASSERT_TRUE(derived(4.45f) > derived(3.0f));
++}
++
++void setUp(void) { /* No shared fixture state. */ }
++void tearDown(void) { /* No shared fixture state. */ }
++
++int main(int, char **) {
++    UNITY_BEGIN();
++    RUN_TEST(test_constant_mode_ignores_flow);
++    RUN_TEST(test_constant_mode_passes_zero_through);
++    RUN_TEST(test_line_passes_through_both_calibration_points);
++    RUN_TEST(test_offset_rises_with_flow);
++    RUN_TEST(test_matches_measured_valve_curve_in_the_extraction_band);
++    RUN_TEST(test_known_operating_points);
++    RUN_TEST(test_equal_flows_fall_back);
++    RUN_TEST(test_inverted_flows_fall_back);
++    RUN_TEST(test_inverted_pressures_fall_back);
++    RUN_TEST(test_implausible_slope_falls_back);
++    RUN_TEST(test_non_finite_inputs_fall_back);
++    RUN_TEST(test_uncalibrated_defaults_fall_back);
++    RUN_TEST(test_negative_flow_does_not_invert_the_offset);
++    RUN_TEST(test_extraction_regime_command_stays_clear_of_the_gain_cliff);
++    RUN_TEST(test_fill_regime_command_is_high_but_bounded);
++    return UNITY_END();
++}
 diff --git a/web/src/pages/Settings/index.jsx b/web/src/pages/Settings/index.jsx
 index 3d4da191..fe039359 100644
 --- a/web/src/pages/Settings/index.jsx
