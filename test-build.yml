@@ -1,0 +1,103 @@
+name: Test Build (display only)
+
+# Builds the display firmware with the flow-dependent pressure offset applied,
+# and attaches the .bin files to the run as a downloadable artifact.
+#
+# The build is pinned to the v1.9.0 release tag regardless of which branch you
+# push from, so it does not matter that GitHub's web UI can only create branches
+# from other branches. Your branch only needs to carry this file and the patch.
+#
+# Runs automatically on any push to a branch whose name starts with
+# "flow-offset". Do not look for a "Run workflow" button — GitHub only shows
+# that for workflows on the default branch.
+
+on:
+  push:
+    branches:
+      - 'flow-offset**'
+  workflow_dispatch:
+
+env:
+  BUILD_REF: v1.9.0
+  PATCH_FILE: flow-dependent-offset-v4.patch
+
+jobs:
+  build-display:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the v1.9.0 release, not the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Fetch the patch from the pushed branch
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD -- "${PATCH_FILE}"
+          ls -l "${PATCH_FILE}"
+
+      - name: Apply the flow-dependent offset patch
+        run: |
+          git apply --ignore-whitespace --verbose "${PATCH_FILE}"
+          echo "--- files changed ---"
+          git status --short
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Record version
+        run: |
+          mkdir -p out
+          # These floating tags confuse `git describe`; they may not exist in a fork.
+          git tag -d nightly || true
+          git tag -d db || true
+          # The tree is dirty from the patch, so this stamps the firmware
+          # "v1.9.0-dirty" -- semver treats that as a pre-release of 1.9.0, which
+          # keeps stock 1.9.0 offered as an update and therefore one press away.
+          git describe --tags --dirty --match "v*" > out/version.txt
+          cat out/version.txt
+
+      - name: Unit tests for the valve-offset maths
+        run: pio test -e native -f test_valve_offset
+
+      - name: Build Web UI
+        run: ./scripts/build_webui.sh
+
+      - name: Build display
+        run: |
+          pio run -e display
+          cp .pio/build/display/firmware.bin   out/display-firmware.bin
+          cp .pio/build/display/partitions.bin out/display-partitions.bin
+          cp .pio/build/display/bootloader.bin out/display-bootloader.bin
+
+      - name: Copy boot_app0
+        # Ensures the freshly written app0 image is the one that boots, even
+        # though the board was last updated over the air.
+        run: cp docs/boot_app0.bin out/boot_app0.bin
+
+      - name: Archive firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-firmware
+          path: out/*
+          if-no-files-found: error
