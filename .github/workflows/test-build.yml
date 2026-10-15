@@ -1,5 +1,23 @@
 name: Test Build (display only)
 
+# Builds the display firmware with the flow-dependent pressure offset applied,
+# and attaches the .bin files to the run as a downloadable artifact.
+#
+# The build is pinned to the v1.9.0 release tag regardless of which branch you
+# push from, so it does not matter that GitHub's web UI can only create branches
+# from other branches. Your branch only needs to carry this file and the patch.
+#
+# The patch is NOT named here. The job picks the highest-numbered
+# flow-dependent-offset-vN.patch present on the commit you pushed. An earlier
+# version of this file hard-coded the name, and when the name drifted behind the
+# branch the build quietly produced the OLD firmware -- it applied cleanly,
+# passed every test, and dated the artifact correctly. Deriving the name is the
+# fix; out/patch.txt in the artifact is the receipt.
+#
+# Runs automatically on any push to a branch whose name starts with
+# "flow-offset". Do not look for a "Run workflow" button -- GitHub only shows
+# that for workflows on the default branch.
+
 on:
   push:
     branches:
@@ -8,7 +26,6 @@ on:
 
 env:
   BUILD_REF: v1.9.0
-  PATCH_FILE: flow-dependent-offset-v4.patch
 
 jobs:
   build-display:
@@ -22,17 +39,46 @@ jobs:
           fetch-depth: 0
           submodules: 'recursive'
 
-      - name: Fetch the patch from the pushed branch
+      - name: Find the newest patch on the pushed branch
         run: |
+          set -euo pipefail
           git fetch --no-tags --depth=1 origin ${{ github.sha }}
+
+          PATCH_FILE=$(git ls-tree --name-only FETCH_HEAD \
+            | grep -E '^flow-dependent-offset-v[0-9]+\.patch$' \
+            | sort -V | tail -1)
+
+          if [ -z "${PATCH_FILE}" ]; then
+            echo "::error::No flow-dependent-offset-vN.patch found on ${{ github.sha }}."
+            echo "Files at the root of that commit:"
+            git ls-tree --name-only FETCH_HEAD
+            exit 1
+          fi
+
+          echo "PATCH_FILE=${PATCH_FILE}" >> "$GITHUB_ENV"
+          echo "::notice::Building with ${PATCH_FILE}"
+
+      - name: Fetch and apply the patch
+        run: |
+          set -euo pipefail
           git checkout FETCH_HEAD -- "${PATCH_FILE}"
           ls -l "${PATCH_FILE}"
-
-      - name: Apply the flow-dependent offset patch
-        run: |
           git apply --ignore-whitespace --verbose "${PATCH_FILE}"
           echo "--- files changed ---"
           git status --short
+
+      - name: Record what was built
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          {
+            echo "patch:       ${PATCH_FILE}"
+            echo "patch_sha256: $(sha256sum "${PATCH_FILE}" | cut -d' ' -f1)"
+            echo "base_ref:    ${BUILD_REF}"
+            echo "branch:      ${GITHUB_REF_NAME}"
+            echo "commit:      ${GITHUB_SHA}"
+            echo "built_utc:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee out/patch.txt
 
       - uses: actions/cache@v4
         with:
@@ -56,9 +102,12 @@ jobs:
 
       - name: Record version
         run: |
-          mkdir -p out
+          # These floating tags confuse `git describe`; they may not exist in a fork.
           git tag -d nightly || true
           git tag -d db || true
+          # The tree is dirty from the patch, so this stamps the firmware
+          # "v1.9.0-dirty" -- semver treats that as a pre-release of 1.9.0, which
+          # keeps stock 1.9.0 offered as an update and therefore one press away.
           git describe --tags --dirty --match "v*" > out/version.txt
           cat out/version.txt
 
@@ -76,6 +125,8 @@ jobs:
           cp .pio/build/display/bootloader.bin out/display-bootloader.bin
 
       - name: Copy boot_app0
+        # Ensures the freshly written app0 image is the one that boots, even
+        # though the board was last updated over the air.
         run: cp docs/boot_app0.bin out/boot_app0.bin
 
       - name: Archive firmware
