@@ -1174,12 +1174,22 @@ void ShotHistoryPlugin::rebuildIndex() {
                 if (sampleSize == 0) {
                     break;
                 }
+                // A file written by a newer build may carry trailing fields this one does not
+                // know, making the record longer than our own struct. Read only what fits, skip
+                // the remainder so the next sample stays aligned, and decode the prefix.
                 uint8_t raw[sizeof(ShotLogSample)]{};
-                if (shotFile.read(raw, sampleSize) != sampleSize) {
+                const size_t toRead = sampleSize < sizeof(raw) ? sampleSize : sizeof(raw);
+                const size_t valueOffset = shotLogHasElapsedTimestamp(shotHeader) ? 4 : 2;
+                if (toRead <= valueOffset) {
                     break;
                 }
-                const size_t valueOffset = shotLogHasElapsedTimestamp(shotHeader) ? 4 : 2;
-                memcpy(reinterpret_cast<uint8_t *>(&sample.tt), raw + valueOffset, sampleSize - valueOffset);
+                if (shotFile.read(raw, toRead) != toRead) {
+                    break;
+                }
+                if (sampleSize > toRead && !shotFile.seek(sampleSize - toRead, SeekCur)) {
+                    break;
+                }
+                memcpy(reinterpret_cast<uint8_t *>(&sample.tt), raw + valueOffset, toRead - valueOffset);
                 tempSum += sample.ct;
                 tempCount++;
                 if (sample.cp > maxPressure) {

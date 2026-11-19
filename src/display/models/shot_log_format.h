@@ -138,9 +138,19 @@ inline bool shotLogHasElapsedTimestamp(const ShotLogHeader &header) {
     return header.version >= 6 && !(header.version == 6 && header.reserved0 == 26 && header.fieldsMask == 0x1FFF);
 }
 
+// The sample size is a property of the file, not of the version. fieldsMask already allows a
+// file to carry a different set of fields, so trailing fields may be appended without the
+// version implying a fixed width; a reader must therefore take the recorded size at face value
+// rather than deriving it from a version table. Deriving it meant that appending any field made
+// this return 0 and every caller bail, which defeated the extensibility the mask exists for.
+// reserved0 == 0 means the size predates being recorded, so fall back to the version's layout.
+// A size below that layout cannot be read at all and is still rejected.
 inline uint8_t shotLogSampleSize(const ShotLogHeader &header) {
-    const uint8_t expected = header.version >= 7 ? 30 : (shotLogHasElapsedTimestamp(header) ? 28 : 26);
-    return header.reserved0 == 0 || header.reserved0 == expected ? expected : 0;
+    const uint8_t base = header.version >= 7 ? 30 : (shotLogHasElapsedTimestamp(header) ? 28 : 26);
+    if (header.reserved0 == 0) {
+        return base;
+    }
+    return header.reserved0 >= base ? header.reserved0 : 0;
 }
 
 // System info bit definitions for ShotLogSample.si field
