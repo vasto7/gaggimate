@@ -1439,8 +1439,15 @@ float Controller::getEffectivePressureOffset() const {
                          settings.getValveCalF2(), settings.getValveCalPMax());
 }
 
+void Controller::getPumpModelCoefficients(float (&coeffs)[4]) const {
+    parseFloatCsv(settings.getPumpModelCoeffs(), coeffs, 4, NAN);
+}
+
 void Controller::onPressureRead(float pressure) {
     float p = pressure;
+    // Captured before the offset is subtracted and before the clamp below, in the same call that
+    // produces the corrected value, so rp and cp are simultaneous by construction.
+    rawPressure = pressure;
     // Only a running brew opens the grouphead valve, so only then does the mushroom valve eat its cracking pressure
     if (isBrewActive())
         p = std::max(0.0f, p - getEffectivePressureOffset());

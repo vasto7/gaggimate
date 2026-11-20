@@ -11,20 +11,21 @@
 //   Header fields set at start; sampleCount & durationMs patched at end.
 // Per-sample record fields are ALWAYS present in fixed order.
 //   elapsedMs(uint32_t), tt(uint16_t), ct(uint16_t), tp(uint16_t), cp(uint16_t), fl(int16_t), tf(int16_t), pf(int16_t),
-//   vf(int16_t), v(uint16_t), ev(uint16_t), pr(uint16_t), si(uint16_t), wp(uint16_t)
+//   vf(int16_t), v(uint16_t), ev(uint16_t), pr(uint16_t), si(uint16_t), wp(uint16_t), rp(uint16_t)
 // Values are stored as scaled integers (see comments per field below).
 // Sample size: v1-v5 = 26 bytes; v6 = 28 bytes because t is uint32_t;
 // v7 = 30 bytes with cumulative water pumped; v8 retains that layout and adds
-// source-neutral scale/process flags. Legacy hardware-scale v6 used 26 bytes.
+// source-neutral scale/process flags; v9 = 32 bytes with raw pre-offset pressure.
+// Legacy hardware-scale v6 used 26 bytes.
 // Phase data moved to header transitions in v5.
 // Older files may have fewer fields - use fieldsMask to determine layout.
 
 static constexpr uint32_t SHOT_LOG_MAGIC = 0x544F4853; // 'S''H''O''T' little-endian 0x54 0x4F 0x48 0x53
-static constexpr uint8_t SHOT_LOG_VERSION = 8;
+static constexpr uint8_t SHOT_LOG_VERSION = 9;
 static constexpr uint16_t SHOT_LOG_HEADER_SIZE = 512;
 static constexpr uint16_t SHOT_LOG_SAMPLE_INTERVAL_MS = 250; // nominal recording interval
-static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x3FFF; // 14 fields present
-static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 30;
+static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x7FFF; // 15 fields present
+static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 32;
 
 // Field bit positions (for future expansion)
 static constexpr uint32_t SHOT_LOG_FIELD_T = 0x0001;  // elapsed time (bit 0)
@@ -41,7 +42,8 @@ static constexpr uint32_t SHOT_LOG_FIELD_EV = 0x0400; // estimated weight (bit 1
 static constexpr uint32_t SHOT_LOG_FIELD_PR = 0x0800; // puck resistance (bit 11)
 static constexpr uint32_t SHOT_LOG_FIELD_SI = 0x1000; // system info (bit 12)
 static constexpr uint32_t SHOT_LOG_FIELD_WP = 0x2000; // cumulative water pumped (bit 13)
-// Bits 14-31 available for future fields
+static constexpr uint32_t SHOT_LOG_FIELD_RP = 0x4000; // raw pressure, pre-offset (bit 14)
+// Bits 15-31 available for future fields
 
 // Phase transition structure for version 5+ headers
 // transitionReason was a reserved/padding byte through v5; repurposing it keeps the struct byte-identical,
@@ -95,8 +97,27 @@ struct ShotLogHeader {
     // Carved from the v5 reserved padding; old files have 0 here and old readers ignore it.
     uint16_t brewDelayMs; // 2 bytes
 
+    // Shot settings snapshot (v9). Carved from the v5 reserved padding; old files have zeros
+    // here and old readers ignore it. These are the shot-time parameters a reader needs in
+    // order to interpret the log without depending on whatever the settings happen to be at
+    // export time - the second half of the defect this version addresses.
+    uint8_t settingsVersion;            // 1 = this layout; 0 = absent (file predates v9)
+    uint8_t pressureOffsetMode;         // 0 = fixed offset
+    uint8_t pressureOffsetModelVersion; // how to read the coefficients below
+    uint8_t settingsFlags;              // reserved for future booleans
+    float pressureOffsetIntercept;      // bar; the offset in force at shot start
+    float pressureOffsetSlope;          // bar per g/s; 0 in fixed mode
+    // The pump flow model in force, as Settings::getPumpModelCoeffs() parses it. Not derivable
+    // from the log, and needed to recover duty as fl / geoFlow(rp); without it, recalibrating
+    // the pump silently rewrites the duty column of every shot already recorded.
+    // The trailing NaNs distinguish the two modes, exactly as the controller reads them:
+    // c[2]/c[3] NaN means two-point flow measurement, where c[0] and c[1] are the flows at
+    // 1 bar and 9 bar; four finite values mean a polynomial model.
+    float pumpModelCoeffs[4];
+    uint32_t firmwareBuildId; // see shotLogBuildId(); `version` above is the FORMAT version
+
     // Future expansion - pad to 512 bytes total
-    uint8_t reserved_v5[50]; // Manual padding to reach 512 bytes
+    uint8_t reserved_v9[18]; // Manual padding to reach 512 bytes
 };
 #pragma pack(pop)
 
@@ -126,6 +147,11 @@ struct ShotLogSample {
     uint16_t pr; // puck resistance * 100
     uint16_t si; // system info bit-packed
     uint16_t wp; // water pumped * 10
+    // The calibrated system pressure as received from the controller board, before the
+    // display-frame Pressure Offset is subtracted and before the resulting value is clamped at
+    // zero. cp is lossy below the offset; this is not. Captured in the same onPressureRead call
+    // as cp, so the pair is simultaneous by construction.
+    uint16_t rp; // raw pressure * 10
 };
 #pragma pack(pop)
 
@@ -145,6 +171,18 @@ inline bool shotLogHasElapsedTimestamp(const ShotLogHeader &header) {
 // this return 0 and every caller bail, which defeated the extensibility the mask exists for.
 // reserved0 == 0 means the size predates being recorded, so fall back to the version's layout.
 // A size below that layout cannot be read at all and is still rejected.
+// FNV-1a over the firmware version string, so four bytes can identify the build that wrote a
+// file. Nothing else in the header does: `version` is the format version, and a stored mode
+// byte becomes uninterpretable once that mode's meaning changes between releases.
+inline uint32_t shotLogBuildId(const char *version) {
+    uint32_t hash = 2166136261u;
+    for (const char *c = version; c != nullptr && *c != '\0'; ++c) {
+        hash ^= static_cast<uint8_t>(*c);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 inline uint8_t shotLogSampleSize(const ShotLogHeader &header) {
     const uint8_t base = header.version >= 7 ? 30 : (shotLogHasElapsedTimestamp(header) ? 28 : 26);
     if (header.reserved0 == 0) {

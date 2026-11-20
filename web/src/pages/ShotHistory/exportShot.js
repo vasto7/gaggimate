@@ -21,6 +21,8 @@ export function toExportShot(shot, notes = shot.notes ?? null) {
       ev: round2(s.ev),
       pr: round2(s.pr),
       wp: round2(s.wp),
+      // Undefined, and so omitted, for shots recorded before v9.
+      rp: round2(s.rp),
       systemInfo: s.systemInfo,
       phaseNumber: s.phaseNumber,
       phaseDisplayNumber: s.phaseDisplayNumber,

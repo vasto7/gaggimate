@@ -29,6 +29,7 @@ const FIELD_BITS = {
   PR: 11, // puck resistance
   SI: 12, // system info (v2+)
   WP: 13, // cumulative water pumped
+  RP: 14, // raw pressure before the offset and before the zero clamp (v9+)
   // Phase number moved to header transitions in v5+
 };
 
@@ -69,6 +70,7 @@ const FIELD_DEFS = {
     }),
   },
   [FIELD_BITS.WP]: { name: 'wp', type: 'uint16', scale: WEIGHT_SCALE },
+  [FIELD_BITS.RP]: { name: 'rp', type: 'uint16', scale: PRESSURE_SCALE },
   // Phase number field removed in v5+, moved to header transitions
 };
 
@@ -196,6 +198,25 @@ export function parseBinaryShot(arrayBuffer, id) {
     finalExitReason = view.getUint8(110 + 12 * 29 + 1);
     // brewDelayMs (ms) follows finalExitReason; legacy files read 0 (was reserved padding).
     brewDelay = view.getUint16(110 + 12 * 29 + 2, true);
+  }
+
+  // Shot settings snapshot (v9+), carved from the v5 reserved padding. Files written before v9
+  // have zeros here, which settingsVersion === 0 reports as absent rather than as real values.
+  let shotSettings = null;
+  const settingsOffset = 110 + 12 * 29 + 4;
+  if (view.byteLength >= settingsOffset + 32 && view.getUint8(settingsOffset) >= 1) {
+    shotSettings = {
+      settingsVersion: view.getUint8(settingsOffset),
+      pressureOffsetMode: view.getUint8(settingsOffset + 1),
+      pressureOffsetModelVersion: view.getUint8(settingsOffset + 2),
+      settingsFlags: view.getUint8(settingsOffset + 3),
+      pressureOffsetIntercept: view.getFloat32(settingsOffset + 4, true),
+      pressureOffsetSlope: view.getFloat32(settingsOffset + 8, true),
+      // c[2]/c[3] NaN means two-point flow measurement, where c[0] and c[1] are the flows at
+      // 1 bar and 9 bar; four finite values mean a polynomial model.
+      pumpModelCoeffs: [0, 1, 2, 3].map(i => view.getFloat32(settingsOffset + 12 + 4 * i, true)),
+      firmwareBuildId: view.getUint32(settingsOffset + 28, true),
+    };
   }
 
   // The original hardware-scale v6 used 26-byte records with 16-bit ticks.
@@ -338,5 +359,6 @@ export function parseBinaryShot(arrayBuffer, id) {
     finalExitReason, // v5+ reason the shot ended (last phase exit or manual abort)
     finalExitReasonLabel: PHASE_EXIT_REASON_LABELS[finalExitReason] ?? 'Unknown',
     brewDelay, // v5+ predictive brew delay (ms) the shot ran with
+    shotSettings, // v9+ settings in force when the shot was recorded; null for older files
   };
 }

@@ -148,6 +148,16 @@ void ShotHistoryPlugin::record() {
                 header.headerSize = SHOT_LOG_HEADER_SIZE;
                 header.sampleInterval = SHOT_LOG_SAMPLE_INTERVAL_MS;
                 header.fieldsMask = SHOT_LOG_FIELDS_MASK_ALL;
+                // Shot-time settings snapshot, so a reader never has to assume that today's
+                // settings were the ones in force when this shot was recorded.
+                header.settingsVersion = 1;
+                header.pressureOffsetMode = 0; // fixed offset
+                header.pressureOffsetModelVersion = 1;
+                header.settingsFlags = 0;
+                header.pressureOffsetIntercept = controller->getSettings().getPressureOffset();
+                header.pressureOffsetSlope = 0.0f;
+                controller->getPumpModelCoefficients(header.pumpModelCoeffs);
+                header.firmwareBuildId = shotLogBuildId(BUILD_GIT_VERSION);
                 header.startEpoch = getTime();
                 Profile profile = controller->getProfileManager()->getSelectedProfile();
                 strncpy(header.profileId, profile.id.c_str(), sizeof(header.profileId) - 1);
@@ -193,6 +203,7 @@ void ShotHistoryPlugin::record() {
         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
         sample.si = getSystemInfo(); // Pack system state information
         sample.wp = encodeUnsigned(controller->getCurrentWaterPumped(), WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+        sample.rp = encodeUnsigned(controller->getRawPressure(), PRESSURE_SCALE, PRESSURE_MAX_VALUE);
         // Apply the same spike rejection to the final-weight maximum. A real
         // sustained step is accepted on the following stable sample, whereas a
         // one-sample excursion cannot permanently inflate the shot total.

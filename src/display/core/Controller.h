@@ -84,6 +84,13 @@ class Controller {
     // Mushroom-valve drop to apply right now. Equals the fixed Pressure Offset unless the
     // flow-derived mode is enabled and fully calibrated, in which case it tracks the current flow.
     float getEffectivePressureOffset() const;
+    // The calibrated system pressure as received from the controller board, before the Pressure
+    // Offset is subtracted and before the clamp at zero. Recorded in the shot log because the
+    // clamp makes the corrected value lossy below the offset.
+    float getRawPressure() const { return rawPressure; }
+    // The pump flow model currently in force, parsed from the stored coefficient string into
+    // four floats exactly as setPumpModelCoeffs() does, trailing NaNs and all.
+    void getPumpModelCoefficients(float (&coeffs)[4]) const;
     virtual float getCurrentPumpPower() const { return currentPumpPower; }
     virtual float getCurrentHeaterPower() const { return currentHeaterPower; }
     virtual float getCurrentPuckResistance() const { return currentPuckResistance; }
@@ -266,6 +273,7 @@ class Controller {
     float targetPressure = 0.0f;
     float currentPuckFlow = 0.0f;
     float currentPumpFlow = 0.0f;
+    float rawPressure = 0.0f;
     float currentPumpPower = 0.0f;
     float currentHeaterPower = 0.0f;
     float currentPuckResistance = 0.0f;
