@@ -1,0 +1,87 @@
+name: Test Build (display only)
+
+# Builds the display board firmware from whatever is on the current branch and
+# attaches the .bin files to the run as a downloadable artifact.
+#
+# Unlike the project's own build.yml / build-nightly.yml, this does NOT try to
+# publish to the GaggiMate update server, so it works in a personal fork with no
+# secrets configured. Unlike pr-flash.yml, it does not need gh-pages write access.
+#
+# Run it from the Actions tab: "Test Build (display only)" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'flow-offset**'
+      - 'test-build**'
+
+jobs:
+  build-display:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Add version
+        run: |
+          mkdir -p out
+          # These floating tags confuse `git describe`; they may or may not exist in a fork.
+          git tag -d nightly || true
+          git tag -d db || true
+          git describe --tags --dirty --match "v*" > out/version.txt
+          cat out/version.txt
+
+      - name: Build Web UI
+        run: ./scripts/build_webui.sh
+
+      - name: Build display
+        run: |
+          pio run -e display
+          cp .pio/build/display/firmware.bin   out/display-firmware.bin
+          cp .pio/build/display/partitions.bin out/display-partitions.bin
+          cp .pio/build/display/bootloader.bin out/display-bootloader.bin
+
+      - name: Copy boot_app0
+        # Needed so the freshly flashed app0 image is the one that boots, even if
+        # the board was last updated OTA and is currently running from app1.
+        run: cp docs/boot_app0.bin out/boot_app0.bin
+
+      - name: Unit tests
+        # valve-offset maths, and the shot-log layout: the web parser reads several
+        # header fields by hard-coded offset, so a silent struct change would be a
+        # silent misparse. The layout test asserts those offsets.
+        run: |
+          pio test -e native -f test_valve_offset
+          pio test -e native -f test_shot_log_layout
+
+      - name: Archive firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-firmware
+          path: out/*
+          if-no-files-found: error
