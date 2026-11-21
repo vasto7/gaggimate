@@ -30,6 +30,7 @@ const FIELD_BITS = {
   SI: 12, // system info (v2+)
   WP: 13, // cumulative water pumped
   RP: 14, // raw pressure before the offset and before the zero clamp (v9+)
+  PO: 15, // offset actually applied to this sample (v10, test build only)
   // Phase number moved to header transitions in v5+
 };
 
@@ -71,6 +72,7 @@ const FIELD_DEFS = {
   },
   [FIELD_BITS.WP]: { name: 'wp', type: 'uint16', scale: WEIGHT_SCALE },
   [FIELD_BITS.RP]: { name: 'rp', type: 'uint16', scale: PRESSURE_SCALE },
+  [FIELD_BITS.PO]: { name: 'po', type: 'uint16', scale: PRESSURE_SCALE },
   // Phase number field removed in v5+, moved to header transitions
 };
 
@@ -217,6 +219,11 @@ export function parseBinaryShot(arrayBuffer, id) {
       pumpModelCoeffs: [0, 1, 2, 3].map(i => view.getFloat32(settingsOffset + 12 + 4 * i, true)),
       firmwareBuildId: view.getUint32(settingsOffset + 28, true),
     };
+    // settingsVersion 2 (test build) appends the cap the flow-derived offset is limited to.
+    // mode 1 means the flow-derived model; 0 means the fixed offset, with slope 0.
+    if (shotSettings.settingsVersion >= 2) {
+      shotSettings.pressureOffsetPMax = view.getFloat32(settingsOffset + 32, true);
+    }
   }
 
   // The original hardware-scale v6 used 26-byte records with 16-bit ticks.

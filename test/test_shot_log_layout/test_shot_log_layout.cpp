@@ -36,6 +36,11 @@ void test_legacy_and_current_layouts() {
     TEST_ASSERT_EQUAL_UINT8(32, shotLogSampleSize(h));
     // A file written by a future firmware with a wider record still reads: the size comes from
     // the file, and the reader skips the remainder it does not know about.
+    h.reserved0 = 36;
+    TEST_ASSERT_EQUAL_UINT8(36, shotLogSampleSize(h));
+    // TEST BUILD: v10 adds po.
+    h.version = 10;
+    h.fieldsMask = 0xFFFF;
     h.reserved0 = 34;
     TEST_ASSERT_EQUAL_UINT8(34, shotLogSampleSize(h));
 }
@@ -44,17 +49,21 @@ void test_v9_field_offsets() {
     // The web parser reads these by hard-coded offset, so a silent change here would be a
     // silent misparse there. Keep the two in step.
     TEST_ASSERT_EQUAL_UINT32(512, sizeof(ShotLogHeader));
-    TEST_ASSERT_EQUAL_UINT32(32, sizeof(ShotLogSample));
-    // rp is appended last, so the first 30 bytes of a v9 record are byte-identical to a v8 one.
+    TEST_ASSERT_EQUAL_UINT32(34, sizeof(ShotLogSample));
+    // Both are appended, so the first 30 bytes of a record stay byte-identical to a v8 one and
+    // the first 32 to a v9 one.
     TEST_ASSERT_EQUAL_UINT32(30, offsetof(ShotLogSample, rp));
+    TEST_ASSERT_EQUAL_UINT32(32, offsetof(ShotLogSample, po));
 
     TEST_ASSERT_EQUAL_UINT32(462, offsetof(ShotLogHeader, settingsVersion));
     TEST_ASSERT_EQUAL_UINT32(466, offsetof(ShotLogHeader, pressureOffsetIntercept));
     TEST_ASSERT_EQUAL_UINT32(470, offsetof(ShotLogHeader, pressureOffsetSlope));
     TEST_ASSERT_EQUAL_UINT32(474, offsetof(ShotLogHeader, pumpModelCoeffs));
     TEST_ASSERT_EQUAL_UINT32(490, offsetof(ShotLogHeader, firmwareBuildId));
+    // Appended after the v9 block, so every offset above is unchanged.
+    TEST_ASSERT_EQUAL_UINT32(494, offsetof(ShotLogHeader, pressureOffsetPMax));
     // The snapshot must stay inside the padding it was carved from.
-    TEST_ASSERT_EQUAL_UINT32(494, offsetof(ShotLogHeader, reserved_v9));
+    TEST_ASSERT_EQUAL_UINT32(498, offsetof(ShotLogHeader, reserved_v10));
 }
 
 void test_settings_snapshot_absent_in_old_files() {

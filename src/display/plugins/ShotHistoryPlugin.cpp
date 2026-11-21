@@ -150,12 +150,31 @@ void ShotHistoryPlugin::record() {
                 header.fieldsMask = SHOT_LOG_FIELDS_MASK_ALL;
                 // Shot-time settings snapshot, so a reader never has to assume that today's
                 // settings were the ones in force when this shot was recorded.
-                header.settingsVersion = 1;
-                header.pressureOffsetMode = 0; // fixed offset
+                //
+                // TEST BUILD: settingsVersion 2 records the flow-derived model rather than
+                // upstream v9's fixed offset, and adds the cap. The mode byte reports what the
+                // user enabled; if the calibration is not usable the firmware silently falls back
+                // to the fixed offset, and the per-sample po is what reveals that, since it is the
+                // value actually applied.
+                Settings &shotSettings = controller->getSettings();
+                const bool flowDerived = shotSettings.isPressureOffsetFlowDerived();
+                header.settingsVersion = 2;
+                header.pressureOffsetMode = flowDerived ? 1 : 0;
                 header.pressureOffsetModelVersion = 1;
                 header.settingsFlags = 0;
-                header.pressureOffsetIntercept = controller->getSettings().getPressureOffset();
-                header.pressureOffsetSlope = 0.0f;
+                if (flowDerived) {
+                    // Same two lines as ValveOffset.h; the guards live there and po is the record
+                    // of what they decided.
+                    const float slope = (shotSettings.getValveCalP2() - shotSettings.getValveCalP1()) /
+                                        (shotSettings.getValveCalF2() - shotSettings.getValveCalF1());
+                    header.pressureOffsetSlope = slope;
+                    header.pressureOffsetIntercept = shotSettings.getValveCalP1() - slope * shotSettings.getValveCalF1();
+                    header.pressureOffsetPMax = shotSettings.getValveCalPMax();
+                } else {
+                    header.pressureOffsetSlope = 0.0f;
+                    header.pressureOffsetIntercept = shotSettings.getPressureOffset();
+                    header.pressureOffsetPMax = 0.0f;
+                }
                 controller->getPumpModelCoefficients(header.pumpModelCoeffs);
                 header.firmwareBuildId = shotLogBuildId(BUILD_GIT_VERSION);
                 header.startEpoch = getTime();
@@ -204,6 +223,10 @@ void ShotHistoryPlugin::record() {
         sample.si = getSystemInfo(); // Pack system state information
         sample.wp = encodeUnsigned(controller->getCurrentWaterPumped(), WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.rp = encodeUnsigned(controller->getRawPressure(), PRESSURE_SCALE, PRESSURE_MAX_VALUE);
+        // TEST BUILD. getEffectivePressureOffset(), not getPressureOffset(): the flow-derived
+        // value the firmware actually applied. Logging the fixed setting here would silently
+        // corrupt the very comparison this build exists to make.
+        sample.po = encodeUnsigned(controller->getEffectivePressureOffset(), PRESSURE_SCALE, PRESSURE_MAX_VALUE);
         // Apply the same spike rejection to the final-weight maximum. A real
         // sustained step is accepted on the following stable sample, whereas a
         // one-sample excursion cannot permanently inflate the shot total.

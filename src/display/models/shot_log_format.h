@@ -11,21 +11,25 @@
 //   Header fields set at start; sampleCount & durationMs patched at end.
 // Per-sample record fields are ALWAYS present in fixed order.
 //   elapsedMs(uint32_t), tt(uint16_t), ct(uint16_t), tp(uint16_t), cp(uint16_t), fl(int16_t), tf(int16_t), pf(int16_t),
-//   vf(int16_t), v(uint16_t), ev(uint16_t), pr(uint16_t), si(uint16_t), wp(uint16_t), rp(uint16_t)
+//   vf(int16_t), v(uint16_t), ev(uint16_t), pr(uint16_t), si(uint16_t), wp(uint16_t), rp(uint16_t),
+//   po(uint16_t)
 // Values are stored as scaled integers (see comments per field below).
 // Sample size: v1-v5 = 26 bytes; v6 = 28 bytes because t is uint32_t;
 // v7 = 30 bytes with cumulative water pumped; v8 retains that layout and adds
-// source-neutral scale/process flags; v9 = 32 bytes with raw pre-offset pressure.
+// source-neutral scale/process flags; v9 = 32 bytes with raw pre-offset pressure;
+// v10 = 34 bytes adding the applied offset (TEST BUILD only).
 // Legacy hardware-scale v6 used 26 bytes.
 // Phase data moved to header transitions in v5.
 // Older files may have fewer fields - use fieldsMask to determine layout.
 
 static constexpr uint32_t SHOT_LOG_MAGIC = 0x544F4853; // 'S''H''O''T' little-endian 0x54 0x4F 0x48 0x53
-static constexpr uint8_t SHOT_LOG_VERSION = 9;
+// TEST BUILD: v10 adds the applied offset per sample so the flow-derived model and its cap can be
+// checked against the firmware's own behaviour on real shots. Upstream stops at v9.
+static constexpr uint8_t SHOT_LOG_VERSION = 10;
 static constexpr uint16_t SHOT_LOG_HEADER_SIZE = 512;
 static constexpr uint16_t SHOT_LOG_SAMPLE_INTERVAL_MS = 250; // nominal recording interval
-static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x7FFF; // 15 fields present
-static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 32;
+static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0xFFFF; // 16 fields present
+static constexpr uint32_t SHOT_LOG_SAMPLE_SIZE = 34;
 
 // Field bit positions (for future expansion)
 static constexpr uint32_t SHOT_LOG_FIELD_T = 0x0001;  // elapsed time (bit 0)
@@ -43,7 +47,8 @@ static constexpr uint32_t SHOT_LOG_FIELD_PR = 0x0800; // puck resistance (bit 11
 static constexpr uint32_t SHOT_LOG_FIELD_SI = 0x1000; // system info (bit 12)
 static constexpr uint32_t SHOT_LOG_FIELD_WP = 0x2000; // cumulative water pumped (bit 13)
 static constexpr uint32_t SHOT_LOG_FIELD_RP = 0x4000; // raw pressure, pre-offset (bit 14)
-// Bits 15-31 available for future fields
+static constexpr uint32_t SHOT_LOG_FIELD_PO = 0x8000; // applied offset (bit 15) — TEST BUILD only
+// Bits 16-31 available for future fields
 
 // Phase transition structure for version 5+ headers
 // transitionReason was a reserved/padding byte through v5; repurposing it keeps the struct byte-identical,
@@ -116,8 +121,12 @@ struct ShotLogHeader {
     float pumpModelCoeffs[4];
     uint32_t firmwareBuildId; // see shotLogBuildId(); `version` above is the FORMAT version
 
+    // TEST BUILD (settingsVersion >= 2): the cap the flow-derived offset is limited to. Appended
+    // rather than inserted, so everything above keeps its v9 offsets and a v9 reader is unaffected.
+    float pressureOffsetPMax;
+
     // Future expansion - pad to 512 bytes total
-    uint8_t reserved_v9[18]; // Manual padding to reach 512 bytes
+    uint8_t reserved_v10[14]; // Manual padding to reach 512 bytes
 };
 #pragma pack(pop)
 
@@ -152,6 +161,12 @@ struct ShotLogSample {
     // zero. cp is lossy below the offset; this is not. Captured in the same onPressureRead call
     // as cp, so the pair is simultaneous by construction.
     uint16_t rp; // raw pressure * 10
+    // TEST BUILD only. The offset getEffectivePressureOffset() actually returned for this sample,
+    // which upstream v9 omits because the header snapshot determines it. Kept here because the cap
+    // operates inside the clamped window, where cp is flat and the applied value cannot be checked
+    // against anything else. This is ground truth: if it disagrees with the declared model, the
+    // model is what is wrong.
+    uint16_t po; // applied offset * 10
 };
 #pragma pack(pop)
 
